@@ -1,0 +1,66 @@
+// File:    demo/main.skink
+// Purpose: A short tour of skink-vox — tokenizing, sentence segmentation,
+//          part-of-speech tagging, entity extraction, and readability.
+module main
+
+import "../vox"
+import "../strcase"
+import "../summarize"
+import "../tag"
+import "../tokenize"
+
+fn main() {
+    src := "Marie Curie studied in Paris. She won the Nobel Prize twice."
+
+    // The one-call pipeline: tokenize, segment, tag, extract.
+    doc, err := vox.NewDocument(src)
+    if err.message != "" {
+        println("document error:", err.message)
+        return
+    }
+
+    println("sentences:")
+    for i := 0; i < len(doc.Sentences()); i = i + 1 {
+        s := doc.Sentences()[i]
+        println("  [", s.Start, ":", s.End(), "] ", s.Text)
+    }
+
+    println("tokens:")
+    for i := 0; i < len(doc.Tokens()); i = i + 1 {
+        t := doc.Tokens()[i]
+        println("  [", t.Start, ":", t.End(), "] ", t.Text, " ", t.Tag, " ", t.Label)
+    }
+
+    println("entities:")
+    for i := 0; i < len(doc.Entities()); i = i + 1 {
+        e := doc.Entities()[i]
+        println("  ", e.Label, ": ", e.Text)
+    }
+
+    // Individual stages are available directly.
+    tk := tokenize.NewTokenizerOpts([]fn(*tokenize.Tokenizer){
+        tokenize.UsingSplitCases([]string{}), // keep contractions whole
+    })
+    toks := tk.Tokenize("They'll save us.")
+    print("tokenizer options:")
+    for i := 0; i < len(toks); i = i + 1 {
+        print(" ", toks[i].Text)
+    }
+    println("")
+
+    // A lexicon can override the tagger's predictions.
+    lex := make(map[string]string)
+    lex["refactor"] = "NNP"
+    tg, terr := tag.NewOpts([]fn(*tag.Tagger){tag.WithLexicon(lex)})
+    if terr.message == "" {
+        wt := tg.Tag([]string{"please", "refactor", "this"})
+        println("lexicon:", wt[1].Text, "=", wt[1].Tag)
+    }
+
+    // Case conversion and readability.
+    tc := strcase.NewTitleConverter(strcase.APStyle)
+    println("title:", tc.Convert("the war of the worlds"))
+
+    m := summarize.NewDocument(src)
+    println("readability Flesch-Kincaid:", m.Assess().FleschKincaid)
+}

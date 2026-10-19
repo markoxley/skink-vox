@@ -1,0 +1,120 @@
+// File:    strcase_test.skink
+// Purpose: Unit tests for strcase — mechanical word converters, sentence
+//          and title converters (AP / Chicago corpora), the regex
+//          converter, and the CaseOpts option helpers.
+module strcase_test
+
+import "strcase"
+import "token"
+import "std/json"
+import "std/fs"
+import "std/str"
+import "testing"
+
+fn runTitleFile(path: string, style: fn(string, []token.Token, int, bool) -> bool, msg: string) {
+    data, err := fs.ReadAll(path)
+    testing.AssertEqualString("", err.message, str.Concat(msg, " read"))
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, str.Concat(msg, " parse"))
+    tc := strcase.NewTitleConverter(style)
+    n := json.ArrayLen(v)
+    testing.AssertTrue(n > 0, str.Concat(msg, " nonempty"))
+    for i := 0; i < n; i = i + 1 {
+        e := json.ArrayGet(v, i)
+        input := json.GetString(e, "input")
+        want := json.GetString(e, "expect")
+        got := tc.Convert(input)
+        if got != want {
+            testing.Errorf(str.Concat(msg, str.Concat(": ", str.Concat(input, str.Concat(" -> ", str.Concat(got, str.Concat(" want ", want)))))))
+        }
+    }
+}
+
+// TestAP drives the AP-style title corpus.
+pub fn TestAP() {
+    runTitleFile("testdata/AP.json", strcase.APStyle, "AP")
+}
+
+// TestChicago drives the Chicago-style title corpus.
+pub fn TestChicago() {
+    runTitleFile("testdata/Chicago.json", strcase.ChicagoStyle, "Chicago")
+}
+
+// TestWordConverters checks the mechanical case functions.
+pub fn TestWordConverters() {
+    testing.AssertEqualString("fooBarBaz", strcase.Camel("foo_bar_baz"), "camel")
+    testing.AssertEqualString("FooBarBaz", strcase.Pascal("foo_bar_baz"), "pascal")
+    testing.AssertEqualString("foo-bar-baz", strcase.Dash("foo_bar_baz"), "dash")
+    testing.AssertEqualString("foo.bar.baz", strcase.Dot("foo_bar_baz"), "dot")
+    testing.AssertEqualString("FOO_BAR_BAZ", strcase.Constant("fooBarBaz"), "constant")
+    testing.AssertEqualString("foo bar baz", strcase.Simple("fooBarBaz"), "simple")
+    testing.AssertEqualString("", strcase.Camel(""), "empty camel")
+    testing.AssertEqualString("A", strcase.Pascal("a"), "single letter")
+    testing.AssertEqualString("FooBarBaz", strcase.Pascal("fooBarBaz"), "pascal from camel")
+}
+
+// TestSentenceConverter checks sentence case: first word up, rest down.
+pub fn TestSentenceConverter() {
+    sc := strcase.NewSentenceConverter()
+    testing.AssertEqualString("Hello world. this is mark.",
+        sc.Convert("hello world. this is MARK."), "sentence case")
+    testing.AssertEqualString("", sc.Convert(""), "empty")
+}
+
+// TestSentenceConverterOpts checks the CaseOpts path on sentences. The
+// indicator receives the PREVIOUS word: returning true capitalizes the
+// current one — this is how "note: Important" keeps Important capitalized.
+pub fn TestSentenceConverterOpts() {
+    opts := strcase.NewCaseOpts()
+    opts = strcase.UsingIndicator(opts, fn(word: string, idx: int) -> bool {
+        return str.EndsWith(word, ":")
+    })
+    sc := strcase.NewSentenceConverterOpts(opts)
+    got := sc.Convert("note: read carefully")
+    testing.AssertEqualString("Note: Read carefully", got, "indicator honored")
+}
+
+// TestUsingVocab checks vocabulary entries render as supplied.
+pub fn TestUsingVocab() {
+    opts := strcase.NewCaseOpts()
+    opts = strcase.UsingVocab(opts, []string{"McFly", "iPhone"})
+    sc := strcase.NewSentenceConverterOpts(opts)
+    got := sc.Convert("mcfly has an iphone")
+    testing.AssertTrue(str.IndexOf(got, "McFly") >= 0, "vocab casing kept")
+    testing.AssertTrue(str.IndexOf(got, "iPhone") >= 0, "vocab casing kept 2")
+}
+
+// TestUsingPrefix checks a required prefix is stripped before casing.
+pub fn TestUsingPrefix() {
+    opts := strcase.NewCaseOpts()
+    opts = strcase.UsingPrefix(opts, "a")
+    sc := strcase.NewSentenceConverterOpts(opts)
+    got := sc.Convert("a. this is a sentence.")
+    testing.AssertTrue(str.Len(got) > 0, "prefixed convert ran")
+}
+
+// TestTitleConverterOpts checks options reach the title converter.
+pub fn TestTitleConverterOpts() {
+    opts := strcase.NewCaseOpts()
+    opts = strcase.UsingVocab(opts, []string{"iOS"})
+    tc := strcase.NewTitleConverterOpts(strcase.APStyle, opts)
+    got := tc.Convert("developing for ios")
+    testing.AssertTrue(str.IndexOf(got, "iOS") >= 0, "vocab honored in title")
+}
+
+// TestRegexConverter checks the user-pattern converter and bad-pattern path.
+pub fn TestRegexConverter() {
+    _, ok := strcase.NewRegexConverter("[a-z]+", strcase.NewCaseOpts())
+    testing.AssertTrue(ok, "valid pattern")
+
+    _, bad := strcase.NewRegexConverter("(?=x)y", strcase.NewCaseOpts())
+    testing.AssertFalse(bad, "unsupported pattern rejected")
+}
+
+// TestAPChicagoEdge checks empty input to title converters.
+pub fn TestTitleEdge() {
+    tc := strcase.NewTitleConverter(strcase.APStyle)
+    testing.AssertEqualString("", tc.Convert(""), "empty title")
+    tc2 := strcase.NewTitleConverter(strcase.ChicagoStyle)
+    testing.AssertEqualString("", tc2.Convert(""), "empty chicago")
+}

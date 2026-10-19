@@ -1,0 +1,192 @@
+// File:    summarize_test.skink
+// Purpose: Unit tests for summarize — syllable counting over the full
+//          reference corpus, document metrics, every readability formula,
+//          word density/keywords, and paragraph ranking.
+module summarize_test
+
+import "summarize"
+import "internal/mathutil"
+import "std/json"
+import "std/fs"
+import "std/str"
+import "std/strconv"
+import "testing"
+
+// TestSyllableMap drives every word in testdata/syllables.json (the
+// reference's expected count map).
+pub fn TestSyllableMap() {
+    data, err := fs.ReadAll("testdata/syllables.json")
+    testing.AssertEqualString("", err.message, "read syllables")
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, "parse syllables")
+    n := json.ObjectLen(v)
+    testing.AssertTrue(n > 0, "map nonempty")
+    for i := 0; i < n; i = i + 1 {
+        word, val := json.ObjectGetByIndex(v, i)
+        want := int(json.AsNumber(val))
+        got := summarize.Syllables(word)
+        if got != want {
+            testing.Errorf(str.Concat("syllables(", str.Concat(word, str.Concat(") = ", str.Concat(strconv.Itoa(got), str.Concat(" want ", strconv.Itoa(want)))))))
+        }
+    }
+}
+
+// TestSyllableLists drives the word-list files, where the filename carries
+// the expected count. The reference only requires ~93% accuracy on these
+// lists, so the test measures accuracy rather than demanding exactness.
+pub fn TestSyllableLists() {
+    total := 9462.0
+    right := 0.0
+    for n := 1; n <= 7; n = n + 1 {
+        path := str.Concat("testdata/", str.Concat(strconv.Itoa(n), "-syllable-words.txt"))
+        data, err := fs.ReadAll(path)
+        testing.AssertEqualString("", err.message, "read list")
+        words := str.Split(data, "\n")
+        for i := 0; i < len(words); i = i + 1 {
+            w := str.Trim(words[i])
+            if w == "" {
+                continue
+            }
+            if summarize.Syllables(w) == n {
+                right = right + 1.0
+            }
+        }
+    }
+    // Mirrors the reference test exactly: it rounds the ratio before
+    // comparing, so the threshold is effectively "at least 50%".
+    if mathutil.Round(right / total, 0) < 0.93 {
+        testing.Errorf("less than 93% accurate on syllable lists")
+    }
+}
+
+// TestSyllableGolden checks every listed word against the exact syllable
+// count the reference produces (syllables_golden.json).
+pub fn TestSyllableGolden() {
+    data, err := fs.ReadAll("testdata/syllables_golden.json")
+    testing.AssertEqualString("", err.message, "read golden")
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, "parse golden")
+    n := json.ObjectLen(v)
+    testing.AssertTrue(n > 0, "golden nonempty")
+    bad := 0
+    for i := 0; i < n; i = i + 1 {
+        w, cnt := json.ObjectGetByIndex(v, i)
+        want := int(json.AsNumber(cnt))
+        if summarize.Syllables(w) != want {
+            bad = bad + 1
+            if bad < 5 {
+                testing.Errorf(str.Concat("syllable mismatch: ", w))
+            }
+        }
+    }
+    testing.AssertEqualInt(0, bad, "all syllable counts match reference")
+}
+
+// TestMetrics drives the readability expectations in summarize.json.
+pub fn TestMetrics() {
+    data, err := fs.ReadAll("testdata/summarize.json")
+    testing.AssertEqualString("", err.message, "read metrics")
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, "parse metrics")
+    n := json.ArrayLen(v)
+    testing.AssertTrue(n > 0, "docs nonempty")
+    for i := 0; i < n; i = i + 1 {
+        e := json.ArrayGet(v, i)
+        text := json.GetString(e, "text")
+        doc := summarize.NewDocument(text)
+        a := doc.Assess()
+        assertClose(json.GetNumber(e, "AutomatedReadability"), a.AutomatedReadability, "AutomatedReadability")
+        assertClose(json.GetNumber(e, "ColemanLiau"), a.ColemanLiau, "ColemanLiau")
+        assertClose(json.GetNumber(e, "FleschKincaid"), a.FleschKincaid, "FleschKincaid")
+        assertClose(json.GetNumber(e, "Gunningfog"), a.GunningFog, "GunningFog")
+        assertClose(json.GetNumber(e, "SMOG"), a.SMOG, "SMOG")
+        assertClose(json.GetNumber(e, "LIX"), a.LIX, "LIX")
+        assertClose(json.GetNumber(e, "MeanGrade"), a.MeanGradeLevel, "MeanGradeLevel")
+        assertClose(json.GetNumber(e, "StdDevGrade"), a.StdDevGradeLevel, "StdDevGradeLevel")
+        assertClose(json.GetNumber(e, "DaleChall"), a.DaleChall, "DaleChall")
+        assertClose(json.GetNumber(e, "ReadingEase"), a.ReadingEase, "ReadingEase")
+        testing.AssertEqualFloat(json.GetNumber(e, "sentences"), doc.NumSentences, "NumSentences")
+        testing.AssertEqualFloat(json.GetNumber(e, "words"), doc.NumWords, "NumWords")
+        testing.AssertEqualFloat(json.GetNumber(e, "characters"), doc.NumCharacters, "NumCharacters")
+    }
+}
+
+// assertClose compares floats at 2 decimal places — the corpus precision.
+fn assertClose(want: float, got: float, name: string) {
+    diff := want - got
+    if diff < 0.0 {
+        diff = 0.0 - diff
+    }
+    if diff > 0.005 {
+        testing.Errorf(str.Concat(name, " out of tolerance"))
+    }
+}
+
+// TestDocumentFields checks Document counts and Sentence/Word structure.
+pub fn TestDocumentFields() {
+    doc := summarize.NewDocument("The cat sat on the mat. It was happy.")
+    testing.AssertEqualFloat(2.0, doc.NumSentences, "sentences")
+    testing.AssertEqualFloat(9.0, doc.NumWords, "words")
+    testing.AssertTrue(len(doc.Sentences) == 2, "sentence structs")
+    testing.AssertEqualInt(6, doc.Sentences[0].Length, "sentence length")
+    testing.AssertTrue(len(doc.Sentences[0].Words) == 6, "word structs")
+    testing.AssertEqualInt(0, doc.Sentences[0].Paragraph, "paragraph index")
+    // WordFrequency keys are raw token text — "The" and "the" are
+    // separate entries (parity with the reference).
+    freq, ok := doc.WordFrequency["the"]
+    testing.AssertTrue(ok, "frequency map")
+    testing.AssertEqualInt(1, freq, "the appears once lowercase")
+    fcap, okcap := doc.WordFrequency["The"]
+    testing.AssertTrue(okcap, "capital entry")
+    testing.AssertEqualInt(1, fcap, "The appears once")
+}
+
+// TestWordDensity checks density and keyword maps.
+pub fn TestWordDensity() {
+    doc := summarize.NewDocument("the the the cat cat dog")
+    density := doc.WordDensity()
+    d, ok := density["the"]
+    testing.AssertTrue(ok, "density entry")
+    testing.AssertTrue(d > 0.4 && d < 0.6, "the ~50%")
+    kw := doc.Keywords()
+    _, hasThe := kw["the"]
+    testing.AssertFalse(hasThe, "the is a stop word")
+    cat, okCat := kw["cat"]
+    testing.AssertTrue(okCat, "cat keyword")
+    testing.AssertEqualInt(2, cat, "cat count")
+}
+
+// TestMeanWordLength checks the average length calculation.
+pub fn TestMeanWordLength() {
+    doc := summarize.NewDocument("ab cdef")
+    ml := doc.MeanWordLength()
+    testing.AssertTrue(ml > 2.9 && ml < 3.1, "mean ~3")
+}
+
+// TestSummary checks paragraph ranking output.
+pub fn TestSummary() {
+    doc := summarize.NewDocument("First para about cats and dogs.\n\nSecond para about cats.\n\nThird para about fish.")
+    ranked := doc.Summary(2)
+    testing.AssertTrue(len(ranked) == 2, "top two paragraphs")
+    for i := 0; i < len(ranked); i = i + 1 {
+        testing.AssertTrue(ranked[i].Rank > 0, "ranked paragraph has rank")
+    }
+}
+
+// TestEmptyDoc checks degenerate input does not crash.
+pub fn TestEmptyDoc() {
+    doc := summarize.NewDocument("")
+    a := doc.Assess()
+    testing.AssertTrue(len(doc.Sentences) == 0, "no sentences")
+    _ = a
+    doc2 := summarize.NewDocument("one.")
+    testing.AssertEqualFloat(1.0, doc2.NumWords, "single word")
+}
+
+// TestSyllableEdge checks syllable counting edge cases.
+pub fn TestSyllableEdge() {
+    testing.AssertEqualInt(0, summarize.Syllables(""), "empty")
+    testing.AssertEqualInt(1, summarize.Syllables("a"), "single letter")
+    testing.AssertEqualInt(4, summarize.Syllables("abalone"), "corner case")
+    testing.AssertEqualInt(2, summarize.Syllables("people"), "corner case 2")
+}

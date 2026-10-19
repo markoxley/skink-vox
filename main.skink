@@ -1,0 +1,6 @@
+module main
+
+fn main() -> int {
+    println("Hello from vox!")
+    return 0
+}

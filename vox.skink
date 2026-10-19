@@ -1,0 +1,200 @@
+// File:    vox.skink
+// Purpose: The document pipeline — a port of the reference implementation's
+//          root package. Document ties tokenization, segmentation, tagging,
+//          and entity extraction together for the common case; each stage
+//          can also be used directly through its own module.
+//
+//          # Positions
+//
+//          Everything produced knows where it came from. For any token,
+//          sentence, or entity x produced from text:
+//
+//              text[x.Start:x.End()] == x.Text
+//
+//          # Models are shared
+//
+//          Every model is loaded once per process and shared, so
+//          constructing a Document is cheap and constructing many is
+//          cheaper still.
+module vox
+
+// The bundled models (models/) are baked into every binary that links this
+// module; internal/modelpath serves them through the int: filesystem.
+embed "models"
+
+import "ner"
+import "segment"
+import "tag"
+import "token"
+
+// Token is token.Token, re-exported so callers using only this
+// module do not have to import token themselves.
+pub type Token = token.Token
+import "tokenize"
+import "std/errors"
+
+// Document is text plus whatever was computed about it.
+pub struct Document {
+    // Text is the document's source text.
+    Text: string
+
+    tokens:    []token.Token
+    sentences: []segment.Sentence
+    entities:  []ner.Entity
+
+    // Tokens returns the document's tokens.
+    pub fn Tokens(d: *Document) -> []token.Token {
+        return d.tokens
+    }
+
+    // Sentences returns the document's sentences.
+    pub fn Sentences(d: *Document) -> []segment.Sentence {
+        return d.sentences
+    }
+
+    // Entities returns the document's named entities.
+    pub fn Entities(d: *Document) -> []ner.Entity {
+        return d.entities
+    }
+}
+
+// DocOpts configures a Document — the Skink spelling of the reference's
+// With* option functions. Every stage defaults to enabled.
+pub struct DocOpts {
+    // Tokenize enables tokenization. Tagging and extraction need tokens, so
+    // disabling this disables them too.
+    Tokenize: bool
+    // Segment enables sentence segmentation.
+    Segment: bool
+    // Tag enables part-of-speech tagging.
+    Tag: bool
+    // Extract enables named-entity extraction. Extraction needs tags, so
+    // enabling it enables tagging.
+    Extract: bool
+    // UseTokenizer supplies a custom tokenizer.
+    UseTokenizer: bool
+    tokenizer:    tokenize.Tokenizer
+}
+
+// DefaultDocOpts returns options with every stage enabled.
+pub fn DefaultDocOpts() -> DocOpts {
+    return DocOpts{Tokenize: true, Segment: true, Tag: true, Extract: true}
+}
+
+// WithTokenizer returns opts with the custom tokenizer set.
+pub fn WithTokenizer(opts: DocOpts, t: tokenize.Tokenizer) -> DocOpts {
+    opts.UseTokenizer = true
+    opts.tokenizer = t
+    return opts
+}
+
+// Option configures a Document — the counterpart of the reference's
+// prose.Option. Skink has no variadic calls, so options are applied from a
+// slice by NewDocumentOptions.
+pub type Option = fn(*DocOpts)
+pub fn WithTokenization(include: bool) -> fn(*DocOpts) {
+    return fn(c: *DocOpts) { c.Tokenize = include }
+}
+
+// WithSegmentation enables or disables sentence segmentation.
+pub fn WithSegmentation(include: bool) -> fn(*DocOpts) {
+    return fn(c: *DocOpts) { c.Segment = include }
+}
+
+// WithTagging enables or disables part-of-speech tagging.
+pub fn WithTagging(include: bool) -> fn(*DocOpts) {
+    return fn(c: *DocOpts) { c.Tag = include }
+}
+
+// WithExtraction enables or disables named-entity extraction. Extraction
+// needs part-of-speech tags, so enabling it enables tagging.
+pub fn WithExtraction(include: bool) -> fn(*DocOpts) {
+    return fn(c: *DocOpts) { c.Extract = include }
+}
+
+// UsingTokenizer supplies a custom tokenizer.
+pub fn UsingTokenizer(t: tokenize.Tokenizer) -> fn(*DocOpts) {
+    return fn(c: *DocOpts) {
+        c.UseTokenizer = true
+        c.tokenizer = t
+    }
+}
+
+var defaultTokenizer tokenize.Tokenizer
+var tokInit = false
+
+// NewDocument creates a Document from text with every stage enabled.
+pub fn NewDocument(text: string) -> (Document, errors.Error) {
+    return NewDocumentOpts(text, DefaultDocOpts())
+}
+
+// NewDocumentOptions is NewDocument configured by functional options — the
+// counterpart of the reference's NewDocument(text, opts...). It has no
+// NewDocumentContext counterpart: the pipeline polls no cancellable state.
+pub fn NewDocumentOptions(text: string, opts: []fn(*DocOpts)) -> (Document, errors.Error) {
+    cfg := DefaultDocOpts()
+    for i := 0; i < len(opts); i = i + 1 {
+        opts[i](&cfg)
+    }
+    return NewDocumentOpts(text, cfg)
+}
+
+// NewDocumentOpts creates a Document from text with the given stage
+// selection.
+//
+// By default a document is tokenized, segmented, tagged, and scanned for
+// entities. Skipping entity extraction in particular saves most of the
+// work.
+pub fn NewDocumentOpts(text: string, opts: DocOpts) -> (Document, errors.Error) {
+    cfg := opts
+    // Extraction is defined in terms of tagged tokens; asking for it
+    // without them is a configuration error rather than something to
+    // silently ignore.
+    if cfg.Extract {
+        cfg.Tag = true
+    }
+    if cfg.Tag {
+        cfg.Tokenize = true
+    }
+
+    doc := Document{Text: text}
+
+    if cfg.Segment {
+        seg, err := segment.New()
+        if err.message != "" {
+            return doc, err
+        }
+        doc.sentences = seg.Segment(text)
+    }
+
+    if cfg.Tokenize {
+        if cfg.UseTokenizer {
+            doc.tokens = cfg.tokenizer.Tokenize(text)
+        } else {
+            if !tokInit {
+                tokInit = true
+                defaultTokenizer = tokenize.NewTokenizer()
+            }
+            doc.tokens = defaultTokenizer.Tokenize(text)
+        }
+    }
+
+    if cfg.Tag {
+        tg, err := tag.New()
+        if err.message != "" {
+            return doc, err
+        }
+        tg.TagTokens(doc.tokens)
+    }
+
+    if cfg.Extract {
+        ex, err := ner.New()
+        if err.message != "" {
+            return doc, err
+        }
+        ex.Label(doc.tokens)
+        doc.entities = ex.Chunk(text, doc.tokens)
+    }
+
+    return doc, errors.None()
+}

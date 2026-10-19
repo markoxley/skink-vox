@@ -1,0 +1,660 @@
+// File:    strcase.skink
+// Purpose: Case conversion — a port of the reference implementation's
+//          strcase package. The word-level converters (Simple, Dash, Snake,
+//          Dot, Constant, Pascal, Camel) are purely mechanical; the sentence
+//          and title converters consult the tagger to decide which words to
+//          keep lowercase.
+//
+//          The original relies on PCRE-style patterns for tokenization and
+//          vocabulary matching; since Skink's regex engine is POSIX-only,
+//          the fixed token patterns are implemented as scanners and the
+//          user-supplied vocabulary/prefix patterns run through the small
+//          backtracking engine in internal/mini.
+module strcase
+
+import "internal/mini"
+import "internal/strutil"
+import "internal/unicode"
+import "tag"
+import "token"
+import "tokenize"
+import "std/sort"
+import "std/str"
+
+// ============================================================================
+// Options
+// ============================================================================
+
+// CaseOpts holds the options shared by the case converters.
+//
+// Skink has no variadic option functions, so fields are set directly or
+// through the With* helpers below.
+pub struct CaseOpts {
+    // Prefix is a regex matched before converting the string.
+    //
+    // Example: "a. " in "a. This is a sentence."
+    Prefix: string
+
+    // Vocab lists words with their own capitalization rules. Entries are
+    // matched case-insensitively and may be mini-regex patterns.
+    Vocab: []string
+
+    // Indicator decides whether the PREVIOUS word forces capitalization of
+    // the current one — see SentenceConverter.
+    Indicator:   fn(string, int) -> bool
+    hasIndicator: bool
+}
+
+// NewCaseOpts returns the empty option set.
+pub fn NewCaseOpts() -> CaseOpts {
+    return CaseOpts{}
+}
+
+// UsingVocab returns opts with the vocabulary set, sorted longest-first for
+// greedy matching (as the reference: does).
+pub fn UsingVocab(opts: CaseOpts, vocab: []string) -> CaseOpts {
+    sort.Sort<string>(vocab, vocabLonger)
+    opts.Vocab = vocab
+    return opts
+}
+
+// vocabLonger orders vocabulary entries longest-first.
+fn vocabLonger(a: string, b: string) -> bool {
+    return str.Len(a) > str.Len(b)
+}
+
+// UsingIndicator returns opts with the indicator callback set.
+pub fn UsingIndicator(opts: CaseOpts, indicator: fn(string, int) -> bool) -> CaseOpts {
+    opts.Indicator = indicator
+    opts.hasIndicator = true
+    return opts
+}
+
+// UsingPrefix returns opts with the prefix pattern set.
+pub fn UsingPrefix(opts: CaseOpts, prefix: string) -> CaseOpts {
+    opts.Prefix = prefix
+    return opts
+}
+
+// ============================================================================
+// Word-level converters (purely: mechanical)
+// ============================================================================
+
+// removeCase maps s to rune-wise case t, inserting separators at case
+// boundaries and punctuation positions, then joins on sep.
+fn removeCase(s: string, sep: string, toUpper: bool) -> string {
+    out := ""
+    old := 32 // ' '
+    n := str.Len(s)
+    i := 0
+    for i < n {
+        c, size := unicode.DecodeRune(s, i)
+        if size < 1 {
+            size = 1
+        }
+        alpha := unicode.IsLetter(c) || unicode.IsNumber(c)
+        // NOTE: the reference tests i > 1 — the byte index, so a boundary
+        // between the first two bytes of the string is not detected.
+        mat := i > 1 && unicode.IsLower(old) && unicode.IsUpper(c)
+        if mat || !alpha || (unicode.IsSpace(c) && c != 32) {
+            out = str.Concat(out, " ")
+        }
+        if alpha || c == 32 {
+            if toUpper {
+                out = str.Concat(out, unicode.RuneStr(unicode.ToUpper(c)))
+            } else {
+                out = str.Concat(out, unicode.RuneStr(unicode.ToLower(c)))
+            }
+        }
+        old = c
+        i = i + size
+    }
+    // Collapse runs of spaces (regexp " +") into the separator.
+    return collapseSpaces(unicodeTrimSpace(out), sep)
+}
+
+// collapseSpaces replaces every run of ' ' with sep.
+fn collapseSpaces(s: string, sep: string) -> string {
+    out := ""
+    n := str.Len(s)
+    i := 0
+    for i < n {
+        if s[i] == 32 {
+            j := i
+            for j < n && s[j] == 32 {
+                j = j + 1
+            }
+            out = str.Concat(out, sep)
+            i = j
+        } else {
+            out = str.Concat(out, str.Substr(s, i, 1))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// unicodeTrimSpace trims Unicode whitespace from both ends.
+fn unicodeTrimSpace(s: string) -> string {
+    n := str.Len(s)
+    start := 0
+    for start < n {
+        r, size := unicode.DecodeRune(s, start)
+        if size < 1 || !unicode.IsSpace(r) {
+            break
+        }
+        start = start + size
+    }
+    end := n
+    for end > start {
+        r, size := unicode.DecodeLastRune(s, end)
+        if size < 1 || !unicode.IsSpace(r) {
+            break
+        }
+        end = end - size
+    }
+    return str.Substr(s, start, end - start)
+}
+
+// Simple converts s to space-separated lower case.
+pub fn Simple(s: string) -> string {
+    return removeCase(s, " ", false)
+}
+
+// Dash converts s to dash-separated lower case, as in "kebab-case".
+pub fn Dash(s: string) -> string {
+    return removeCase(s, "-", false)
+}
+
+// Snake converts s to underscore-separated lower case.
+pub fn Snake(s: string) -> string {
+    return removeCase(s, "_", false)
+}
+
+// Dot converts s to dot-separated lower case.
+pub fn Dot(s: string) -> string {
+    return removeCase(s, ".", false)
+}
+
+// Constant converts s to underscore-separated upper case.
+pub fn Constant(s: string) -> string {
+    return removeCase(s, "_", true)
+}
+
+// Pascal converts s to PascalCase.
+pub fn Pascal(s: string) -> string {
+    out := ""
+    wasSpace := false
+    body := removeCase(s, " ", false)
+    n := str.Len(body)
+    i := 0
+    for i < n {
+        c, size := unicode.DecodeRune(body, i)
+        if size < 1 {
+            size = 1
+        }
+        if i == 0 || wasSpace {
+            c = unicode.ToUpper(c)
+        }
+        wasSpace = c == 32
+        if !wasSpace {
+            out = str.Concat(out, unicode.RuneStr(c))
+        }
+        i = i + size
+    }
+    return out
+}
+
+// Camel converts s to camelCase.
+pub fn Camel(s: string) -> string {
+    first := 32
+    n := str.Len(s)
+    i := 0
+    for i < n {
+        c, size := unicode.DecodeRune(s, i)
+        if size < 1 {
+            size = 1
+        }
+        if unicode.IsLetter(c) || unicode.IsNumber(c) {
+            first = c
+            break
+        }
+        i = i + size
+    }
+    body := Pascal(s)
+    if str.Len(body) > 1 {
+        return unicodeTrimSpace(str.Concat(unicode.RuneStr(unicode.ToLower(first)), str.Substr(body, 1, str.Len(body) - 1)))
+    }
+    return s
+}
+
+// ============================================================================
+// Sentence case
+// ============================================================================
+
+// defaultSentIndicator capitalizes after "word:" and after a leading
+// numbered list item like "1.".
+fn defaultSentIndicator(word: string, idx: int) -> bool {
+    if str.EndsWith(word, ":") {
+        return true
+    }
+    if idx == 0 && matchNumberList(word) {
+        return true
+    }
+    return false
+}
+
+// matchNumberList implements the \d+\. contains-check.
+fn matchNumberList(word: string) -> bool {
+    n := str.Len(word)
+    for i := 0; i < n; i = i + 1 {
+        if word[i] >= 48 && word[i] <= 57 {
+            j := i
+            for j < n && word[j] >= 48 && word[j] <= 57 {
+                j = j + 1
+            }
+            if j < n && word[j] == 46 {
+                return true
+            }
+            i = j
+        }
+    }
+    return false
+}
+
+// sentMainToken consumes one main token at s[i]: a run of Unicode letters,
+// numbers, or '*' followed by non-whitespace bytes. Returns the end offset,
+// or -1 if s[i] cannot start a token.
+fn sentMainToken(s: string, i: int) -> int {
+    r, size := unicode.DecodeRune(s, i)
+    if size < 1 {
+        return -1
+    }
+    if !(unicode.IsLetter(r) || unicode.IsNumber(r) || r == 42) {
+        return -1
+    }
+    n := str.Len(s)
+    j := i
+    for j < n {
+        r2, sz := unicode.DecodeRune(s, j)
+        if sz < 1 {
+            break
+        }
+        if !(unicode.IsLetter(r2) || unicode.IsNumber(r2) || r2 == 42) {
+            break
+        }
+        j = j + sz
+    }
+    // [^\s]* — consume any non-whitespace runes.
+    for j < n {
+        r2, sz := unicode.DecodeRune(s, j)
+        if sz < 1 || unicode.IsSpace(r2) {
+            break
+        }
+        j = j + sz
+    }
+    return j
+}
+
+// sentFindAll tokenizes s with the reference's sentence-case pattern:
+// `\b(?:vocab)\b|[\p{N}\p{L}*]+[^\s]*` matched case-insensitively.
+fn sentFindAll(s: string, sc: *SentenceConverter) -> []string {
+    var toks []string
+    n := str.Len(s)
+    i := 0
+    for i < n {
+        // Try vocabulary alternatives first (alternation order = sorted
+        // longest-first at option-build: time).
+        end := -1
+        for v := 0; v < len(sc.vocabPats); v = v + 1 {
+            e := mini.MatchAt(&sc.vocabPats[v], s, i)
+            if e > i {
+                end = e
+                break
+            }
+        }
+        if end < 0 {
+            end = sentMainToken(s, i)
+            if end <= i {
+                end = -1
+            }
+        }
+        if end >= 0 {
+            toks = append(toks, str.Substr(s, i, end - i))
+            i = end
+            continue
+        }
+        _, sz := unicode.DecodeRune(s, i)
+        if sz < 1 {
+            sz = 1
+        }
+        i = i + sz
+    }
+    return toks
+}
+
+// SentenceConverter converts a string to sentence case.
+pub struct SentenceConverter {
+    Opts: CaseOpts
+
+    // vocabPats caches each vocabulary entry compiled as \b(?:entry)\b with
+    // case-insensitive matching — the same shape the reference builds.
+    vocabPats: []mini.Pattern
+
+    // Convert returns a copy of s in sentence case.
+    pub fn Convert(sc: *SentenceConverter, s: string) -> string {
+        var made []string
+
+        prefix := ""
+        if sc.Opts.Prefix != "" {
+            p, ok := mini.New(sc.Opts.Prefix)
+            if ok {
+                a, b := mini.Find(&p, s)
+                if a >= 0 {
+                    prefix = str.Substr(s, a, b - a)
+                    // TrimPrefix — only strips when it really is a prefix.
+                    if a == 0 {
+                        s = str.Substr(s, b, str.Len(s) - b)
+                    }
+                }
+            }
+        }
+
+        tokens := sentFindAll(s, sc)
+
+        for i := 0; i < len(tokens); i = i + 1 {
+            tok := tokens[i]
+            prev := ""
+            if i - 1 >= 0 {
+                prev = tokens[i - 1]
+            }
+
+            entry := sentInVocab(sc, tok)
+            if entry != "" {
+                made = append(made, entry)
+            } else if i == 0 || sc.Opts.Indicator(prev, i - 1) {
+                made = append(made, strutil.ToTitle(tok, true))
+            } else {
+                made = append(made, unicode.ToLowerStr(tok))
+            }
+        }
+
+        return str.Concat(prefix, str.Join(made, " "))
+    }
+}
+
+// NewSentenceConverter returns a SentenceConverter with default options.
+pub fn NewSentenceConverter() -> SentenceConverter {
+    return NewSentenceConverterOpts(NewCaseOpts())
+}
+
+// NewSentenceConverterOpts returns a SentenceConverter using opts.
+pub fn NewSentenceConverterOpts(opts: CaseOpts) -> SentenceConverter {
+    if !opts.hasIndicator {
+        opts.Indicator = defaultSentIndicator
+        opts.hasIndicator = true
+    }
+    sc := SentenceConverter{Opts: opts}
+    for i := 0; i < len(opts.Vocab); i = i + 1 {
+        pat, ok := mini.New(str.Concat("(?i)\\b(?:", str.Concat(opts.Vocab[i], ")\\b")))
+        if ok {
+            sc.vocabPats = append(sc.vocabPats, pat)
+        }
+    }
+    return sc
+}
+
+// sentInVocab returns the canonical vocabulary form of s, s itself when it
+// matches a vocab pattern, or "" when absent.
+fn sentInVocab(sc: *SentenceConverter, s: string) -> string {
+    for i := 0; i < len(sc.Opts.Vocab); i = i + 1 {
+        pat := sc.Opts.Vocab[i]
+        if unicode.EqualFold(pat, s) {
+            return pat
+        }
+        mp, ok := mini.New(pat)
+        if ok && mini.Match(&mp, s) {
+            return s
+        }
+    }
+    return ""
+}
+
+// ============================================================================
+// Title case
+// ============================================================================
+
+// IgnoreFunc decides whether word should stay lowercase; firstOrLast marks
+// the first or last word of the string. In Skink it is a plain fn type:
+// fn(word: string, tags: []token.Token, idx: int, firstOrLast: bool) -> bool
+
+// smallWords and prepositions drive the AP/Chicago style rules.
+fn smallWords() -> []string {
+    return []string{
+        "a", "an", "and", "as", "at", "but", "by", "en", "for", "if", "in", "nor",
+        "of", "on", "or", "per", "the", "to", "vs", "vs.", "via", "v", "v.",
+    }
+}
+
+fn prepositions() -> []string {
+    return []string{
+        "with", "from", "into", "during", "including", "until", "against", "among",
+        "throughout", "despite", "towards", "upon", "concerning", "about", "over",
+        "through", "before", "between", "after", "since", "without", "under",
+        "within", "along", "following", "across", "beyond", "around", "down",
+        "near", "above",
+    }
+}
+
+// APStyle capitalizes according to the Associated Press Stylebook:
+// first and last words always capitalized; "to" capitalized in infinitives;
+// articles, conjunctions, and short prepositions lowercase.
+pub fn APStyle(word: string, tags: []token.Token, idx: int, bounding: bool) -> bool {
+    if word == "to" && idx + 1 < len(tags) {
+        return str.StartsWith(tags[idx + 1].Tag, "NN")
+    }
+    return !bounding && strutil.StringInSlice(word, smallWords())
+}
+
+// ChicagoStyle lowercases articles, coordinating conjunctions, and
+// prepositions regardless of length, unless first or last.
+pub fn ChicagoStyle(word: string, tags: []token.Token, idx: int, bounding: bool) -> bool {
+    return !bounding && (strutil.StringInSlice(word, smallWords()) ||
+        strutil.StringInSlice(word, prepositions()))
+}
+
+// TitleConverter converts a string to title case according to its style.
+pub struct TitleConverter {
+    Opts:   CaseOpts
+    ignore: fn(string, []token.Token, int, bool) -> bool
+
+    // Convert returns a copy of s in title case format.
+    pub fn Convert(tc: *TitleConverter, s: string) -> string {
+        prefix := ""
+        if tc.Opts.Prefix != "" {
+            p, ok := mini.New(tc.Opts.Prefix)
+            if ok {
+                a, b := mini.Find(&p, s)
+                if a >= 0 {
+                    prefix = str.Substr(s, a, b - a)
+                    if a == 0 {
+                        s = str.Substr(s, b, str.Len(s) - b)
+                    }
+                }
+            }
+        }
+
+        idx := 0
+        pos := 0
+        t := sanitize(s)
+        end := str.Len(t)
+
+        // NOTE: the tagger is sensitive to trailing punctuation AND the initial
+        // case of the input.
+        forTagging := s
+        if !strutil.HasAnySuffix(s, []string{".", "!", "?"}) {
+            forTagging = str.Concat(s, ".")
+        }
+        if !titleTokInit {
+            titleTokInit = true
+            titleTok = tokenize.NewTreebankWordTokenizer()
+        }
+        words := titleTok.Tokenize(forTagging)
+
+        if !titleTaggerInit {
+            titleTaggerInit = true
+            tg, _ := tag.New()
+            titleTagger = tg
+        }
+        tags := titleTagger.Tag(words)
+        widx := -1
+
+        out := ""
+        last := 0
+        n := str.Len(s)
+        i := 0
+        for i < n {
+            e := splitREMatch(s, i)
+            if e < 0 {
+                _, sz := unicode.DecodeRune(s, i)
+                if sz < 1 {
+                    sz = 1
+                }
+                i = i + sz
+                continue
+            }
+            m := str.Substr(s, i, e - i)
+            out = str.Concat(out, str.Substr(s, last, i - last))
+            last = e
+
+            widx = widx + 1
+
+            sm := unicode.ToLowerStr(m)
+            // pos = index of m in t[idx:], or idx-1 when absent.
+            found := -1
+            if idx <= str.Len(t) {
+                found = str.IndexOf(str.Substr(t, idx, str.Len(t) - idx), m)
+            }
+            pos = idx
+            if found >= 0 {
+                pos = idx + found
+            } else {
+                pos = idx - 1
+            }
+            prev := strutil.CharAt(t, pos - 1)
+            ext := unicode.RuneCount(m)
+
+            idx = pos + ext
+            entry := titleInVocab(tc, m)
+            if entry != "" {
+                out = str.Concat(out, entry)
+            } else if tc.ignore(sm, tags, widx, pos == 0 || idx == end) &&
+                (prev == 32 || prev == 45 || prev == 47) &&
+                strutil.CharAt(t, pos - 2) != 58 && strutil.CharAt(t, pos - 2) != 45 &&
+                (strutil.CharAt(t, pos + ext) != 45 || strutil.CharAt(t, pos - 1) == 45) {
+                out = str.Concat(out, sm)
+            } else {
+                out = str.Concat(out, strutil.ToTitle(m, false))
+            }
+            i = e
+        }
+        out = str.Concat(out, str.Substr(s, last, n - last))
+
+        return str.Concat(prefix, out)
+    }
+}
+
+// NewTitleConverter returns a TitleConverter enforcing the given style
+// callback (APStyle or: ChicagoStyle).
+pub fn NewTitleConverter(style: fn(string, []token.Token, int, bool) -> bool) -> TitleConverter {
+    return TitleConverter{Opts: NewCaseOpts(), ignore: style}
+}
+
+// NewTitleConverterOpts returns a TitleConverter enforcing style with opts.
+pub fn NewTitleConverterOpts(style: fn(string, []token.Token, int, bool) -> bool, opts: CaseOpts) -> TitleConverter {
+    return TitleConverter{Opts: opts, ignore: style}
+}
+
+var titleTok tokenize.TreebankWordTokenizer
+var titleTokInit = false
+var titleTagger tag.Interface
+var titleTaggerInit = false
+
+// sanitize replaces curly punctuation with ASCII equivalents, matching the
+// reference's strings.NewReplacer sanitizer.
+fn sanitize(s: string) -> string {
+    out := s
+    out = str.Replace(out, "“", "\"")
+    out = str.Replace(out, "”", "\"")
+    out = str.Replace(out, "‘", "'")
+    out = str.Replace(out, "’", "'")
+    out = str.Replace(out, "–", "-")
+    out = str.Replace(out, "—", "-")
+    out = str.Replace(out, "…", "...")
+    return out
+}
+
+// splitREMatch consumes one `[\p{N}\p{L}]+[^\s-/]*` match at byte i, or -1.
+fn splitREMatch(s: string, i: int) -> int {
+    r, size := unicode.DecodeRune(s, i)
+    if size < 1 || !(unicode.IsLetter(r) || unicode.IsNumber(r)) {
+        return -1
+    }
+    n := str.Len(s)
+    j := i + size
+    for j < n {
+        r2, sz := unicode.DecodeRune(s, j)
+        if sz < 1 || !(unicode.IsLetter(r2) || unicode.IsNumber(r2)) {
+            break
+        }
+        j = j + sz
+    }
+    // [^\s-/]* — non-space, non-dash, non-slash.
+    for j < n {
+        r2, sz := unicode.DecodeRune(s, j)
+        if sz < 1 || unicode.IsSpace(r2) || r2 == 45 || r2 == 47 {
+            break
+        }
+        j = j + sz
+    }
+    return j
+}
+
+// titleInVocab returns the canonical vocabulary form of s, s itself when it
+// matches a vocab pattern, or "" when absent.
+fn titleInVocab(tc: *TitleConverter, s: string) -> string {
+    for i := 0; i < len(tc.Opts.Vocab); i = i + 1 {
+        pat := tc.Opts.Vocab[i]
+        if unicode.EqualFold(pat, s) {
+            return pat
+        }
+        mp, ok := mini.New(pat)
+        if ok && mini.Match(&mp, s) {
+            return s
+        }
+    }
+    return ""
+}
+
+// ============================================================================
+// RegexConverter — a converter spec holding a pattern
+// ============================================================================
+
+// RegexConverter pairs case options with a user-supplied pattern. It is a
+// spec object — the reference exposes it as a holder type.
+pub struct RegexConverter {
+    Opts:    CaseOpts
+    Pattern: mini.Pattern
+    ok:      bool
+}
+
+// NewRegexConverter returns a RegexConverter for regex, or ok=false when the
+// pattern is outside the supported subset.
+pub fn NewRegexConverter(regex: string, opts: CaseOpts) -> (RegexConverter, bool) {
+    if !opts.hasIndicator {
+        opts.Indicator = defaultSentIndicator
+        opts.hasIndicator = true
+    }
+    p, ok := mini.New(regex)
+    return RegexConverter{Opts: opts, Pattern: p, ok: ok}, ok
+}

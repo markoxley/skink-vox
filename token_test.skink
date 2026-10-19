@@ -1,0 +1,37 @@
+// File:    token_test.skink
+// Purpose: Unit tests for the shared token.Token type — the position
+//          invariant src[t.Start:t.End()] == t.Text and the End/In helpers.
+module token_test
+
+import "token"
+import "testing"
+
+// TestEnd verifies End() is Start plus the token's byte length.
+pub fn TestEnd() {
+    t := token.Token{Text: "hello", Start: 10}
+    testing.AssertEqualInt(15, t.End(), "End")
+    e := token.Token{Text: "", Start: 3}
+    testing.AssertEqualInt(3, e.End(), "empty End")
+}
+
+// TestIn verifies In() slices the token back out of its source.
+pub fn TestIn() {
+    src := "one two three"
+    t := token.Token{Text: "two", Start: 4}
+    testing.AssertEqualString("two", t.In(src), "In slices text")
+    testing.AssertEqualInt(7, t.End(), "End")
+}
+
+// TestInBadOffsets verifies In() returns "" for offsets that do not fit
+// the source rather than panicking.
+pub fn TestInBadOffsets() {
+    src := "short"
+    neg := token.Token{Text: "x", Start: -2}
+    testing.AssertEqualString("", neg.In(src), "negative start")
+    over := token.Token{Text: "0123456789", Start: 0}
+    testing.AssertEqualString("", over.In(src), "end past source")
+    // A token whose Text does not match src still returns the slice — In
+    // reports positions, it does not compare text.
+    lie := token.Token{Text: "zzz", Start: 0}
+    testing.AssertEqualString("sho", lie.In(src), "In slices by offsets")
+}

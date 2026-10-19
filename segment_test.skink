@@ -1,0 +1,121 @@
+// File:    segment_test.skink
+// Purpose: Unit tests for segment — the Punkt sentence segmenter, sentence
+//          offsets, WithTraining, and the golden-rules corpus.
+module segment_test
+
+import "segment"
+import "internal/punkt"
+import "std/json"
+import "std/fs"
+import "std/str"
+import "testing"
+
+// TestGoldenRules drives segment_golden.json — inputs mapped to the exact
+// sentence lists the reference implementation produces. (The upstream
+// golden_rules_en.json is aspirational; the reference deviates on a few
+// rules, so the goldens here record verified reference behavior.)
+pub fn TestGoldenRules() {
+    data, err := fs.ReadAll("testdata/segment_golden.json")
+    testing.AssertEqualString("", err.message, "read goldens")
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, "parse goldens")
+    seg, serr := segment.New()
+    testing.AssertEqualString("", serr.message, "segmenter load")
+    n := json.ArrayLen(v)
+    testing.AssertTrue(n > 0, "goldens nonempty")
+    for i := 0; i < n; i = i + 1 {
+        case_ := json.ArrayGet(v, i)
+        input := json.GetString(case_, "input")
+        wantArr := json.GetArray(case_, "output")
+        sents := seg.Segment(input)
+        if len(sents) != json.ArrayLen(wantArr) {
+            testing.Errorf(str.Concat(input, ": sentence count mismatch"))
+            continue
+        }
+        for j := 0; j < len(sents); j = j + 1 {
+            want := json.AsString(json.ArrayGet(wantArr, j))
+            if sents[j].Text != want {
+                testing.Errorf(str.Concat(input, str.Concat(": got ", sents[j].Text)))
+            }
+        }
+    }
+}
+
+// TestCorpus runs the corpus goldens — every input must produce exactly
+// the reference sentence list — and checks the position invariant too.
+pub fn TestCorpus() {
+    data, err := fs.ReadAll("testdata/segment_corpus_golden.json")
+    testing.AssertEqualString("", err.message, "read corpus")
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, "parse corpus")
+    seg, _ := segment.New()
+    n := json.ObjectLen(v)
+    testing.AssertTrue(n > 0, "corpus nonempty")
+    for i := 0; i < n; i = i + 1 {
+        src, wantArr := json.ObjectGetByIndex(v, i)
+        sents := seg.Segment(src)
+        if len(sents) != json.ArrayLen(wantArr) {
+            testing.Errorf(str.Concat("count mismatch on: ", src))
+            continue
+        }
+        last := -1
+        for j := 0; j < len(sents); j = j + 1 {
+            s := sents[j]
+            want := json.AsString(json.ArrayGet(wantArr, j))
+            if s.Text != want {
+                testing.Errorf(str.Concat("segment mismatch on: ", src))
+            }
+            testing.AssertEqualString(s.Text, s.In(src), "sentence offset invariant")
+            testing.AssertTrue(s.Start >= 0, "start >= 0")
+            testing.AssertTrue(s.End() <= str.Len(src), "end <= len")
+            testing.AssertTrue(s.Start > last || s.Start == 0, "ordered")
+            last = s.Start
+        }
+    }
+}
+
+// TestSentenceOffsets checks End/In on a Sentence directly.
+pub fn TestSentenceOffsets() {
+    s := segment.Sentence{Text: "Hello World.", Start: 5}
+    testing.AssertEqualInt(17, s.End(), "End")
+    testing.AssertEqualString("Hello World.", s.In("     Hello World. tail"), "In")
+    bad := segment.Sentence{Text: "toolongtoolongtoolong", Start: 100}
+    testing.AssertEqualString("", bad.In("short"), "In rejects bad offsets")
+}
+
+// TestSegmentText checks the strings-only convenience form.
+pub fn TestSegmentText() {
+    seg, _ := segment.New()
+    sents := seg.SegmentText("Hello World. My name is Jonas.")
+    testing.AssertTrue(len(sents) == 2, "two sentences")
+    testing.AssertEqualString("Hello World.", sents[0], "sent 0")
+    testing.AssertEqualString("My name is Jonas.", sents[1], "sent 1")
+}
+
+// TestEllipsis checks spaced-period ellipsis handling (a regression point
+// during the port: the second token's SentBreak must be cleared).
+pub fn TestEllipsis() {
+    seg, _ := segment.New()
+    sents := seg.Segment("He paused . . . then left. She went home.")
+    testing.AssertTrue(len(sents) == 2, "ellipsis stays inside sentence")
+    testing.AssertEqualString("She went home.", sents[1].Text, "second sentence")
+}
+
+// TestWhitespaceOnly checks whitespace-only and empty input.
+pub fn TestWhitespaceOnly() {
+    seg, _ := segment.New()
+    testing.AssertTrue(len(seg.Segment("")) == 0, "empty")
+    testing.AssertTrue(len(seg.Segment("   \n\t  ")) == 0, "whitespace dropped")
+}
+
+// TestWithTraining checks a caller-supplied punkt model produces a working
+// segmenter.
+pub fn TestWithTraining() {
+    data, err := fs.ReadAll("models/punkt/en.json")
+    testing.AssertEqualString("", err.message, "read model")
+    st, terr := punkt.LoadTraining(data)
+    testing.AssertEqualString("", terr.message, "load training")
+    seg := segment.WithTraining(st)
+    sents := seg.Segment("Hello World. My name is Jonas.")
+    testing.AssertTrue(len(sents) == 2, "custom model segments")
+}

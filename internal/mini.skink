@@ -1,0 +1,684 @@
+// File:    internal/mini.skink
+// Purpose: A small backtracking regular-expression matcher covering the
+//          subset of pattern syntax the case converters and tokenizers need:
+//          literals, ".", character classes, escapes (\d \w \s \b \p{L}
+//          \p{N} and: negations), quantifiers (* + ? {m,n}), anchors (^ $),
+//          alternation, and (?:...) groups, plus a case-insensitive flag.
+//
+//          Semantics are leftmost-first (backtracking), matching the
+//          reference implementation's engine. POSIX ERE — what std/regex
+//          provides — lacks \b, \w, \p{...}, (?i) and alternation-boundary
+//          constructs, so the patterns used by strcase cannot go through it.
+module mini
+
+import "internal/unicode"
+import "std/str"
+import "std/strconv"
+
+// --- AST ---------------------------------------------------------------------
+
+// node kinds
+var nLit = 1    // single rune
+var nAny = 2    // .
+var nClass = 3  // [...]
+var nBol = 4    // ^
+var nEol = 5    // $
+var nWB = 6     // \b
+var nNWB = 7    // \B
+var nGroup = 8  // (?:alt1|alt2|...)
+var nBackref = 9 // \1..\9 — unsupported; treated as literal
+
+// quantifier bounds
+var inf = 1073741823
+
+// Node is one parsed regex element.
+struct Node {
+    kind:    int
+    r:       int    // literal rune for nLit
+    classLo: []int  // class ranges: lo/hi pairs
+    negated: bool
+    alts:    [][]Node // alternation members for nGroup
+    min:     int
+    max:     int
+}
+
+// Pattern is a parsed regular expression.
+pub struct Pattern {
+    src: string
+    alts: [][]Node
+    ci:  bool // case-insensitive
+}
+
+// --- parsing -------------------------------------------------------------------
+
+// parser carries the cursor state for parseAlt.
+struct parser {
+    pat: string
+    pos: int
+    err: string
+}
+
+// New compiles a pattern, accepting an optional leading (?i) flag.
+// Returns ok=false on a parse error.
+pub fn New(pat: string) -> (Pattern, bool) {
+    ci := false
+    if str.StartsWith(pat, "(?i)") {
+        ci = true
+        pat = str.Substr(pat, 4, str.Len(pat) - 4)
+    }
+    p := parser{pat: pat, pos: 0}
+    alts := parseAlt(&p, false)
+    if p.err != "" || p.pos < str.Len(pat) {
+        var out Pattern
+        return out, false
+    }
+    return Pattern{src: pat, alts: alts, ci: ci}, true
+}
+
+// peekByte returns the byte at pos or -1.
+fn peekByte(p: *parser) -> int {
+    if p.pos >= str.Len(p.pat) {
+        return -1
+    }
+    return p.pat[p.pos]
+}
+
+// takeByte consumes and returns the byte at pos.
+fn takeByte(p: *parser) -> int {
+    b := p.pat[p.pos]
+    p.pos = p.pos + 1
+    return b
+}
+
+// parseAlt parses alternatives until ')' (if inGroup) or end.
+fn parseAlt(p: *parser, inGroup: bool) -> [][]Node {
+    var alts [][]Node
+    var seq []Node
+    for p.pos < str.Len(p.pat) {
+        b := p.pat[p.pos]
+        if b == 124 { // '|'
+            alts = append(alts, seq)
+            seq = []Node{}
+            p.pos = p.pos + 1
+            continue
+        }
+        if b == 41 && inGroup { // ')'
+            break
+        }
+        n, ok := parseAtom(p)
+        if !ok {
+            return alts
+        }
+        seq = append(seq, n)
+    }
+    alts = append(alts, seq)
+    return alts
+}
+
+// parseAtom parses one element plus an optional quantifier.
+fn parseAtom(p: *parser) -> (Node, bool) {
+    n := Node{min: 1, max: 1}
+    b := peekByte(p)
+    if b < 0 {
+        p.err = "unexpected end of pattern"
+        return n, false
+    }
+    if b == 40 { // '('
+        p.pos = p.pos + 1
+        if peekByte(p) == 63 { // '?'
+            // (?: ...) non-capturing, (?i...) flag groups unsupported
+            p.pos = p.pos + 1
+            if peekByte(p) == 58 { // ':'
+                p.pos = p.pos + 1
+            } else {
+                p.err = "unsupported group flag"
+                return n, false
+            }
+        }
+        n.kind = nGroup
+        n.alts = parseAlt(p, true)
+        if p.err != "" {
+            return n, false
+        }
+        if peekByte(p) != 41 {
+            p.err = "unclosed group"
+            return n, false
+        }
+        p.pos = p.pos + 1
+    } else if b == 91 { // '['
+        cls, ok := parseClass(p)
+        if !ok {
+            return n, false
+        }
+        n = cls
+    } else if b == 46 { // '.'
+        p.pos = p.pos + 1
+        n.kind = nAny
+    } else if b == 94 { // '^'
+        p.pos = p.pos + 1
+        n.kind = nBol
+    } else if b == 36 { // '$'
+        p.pos = p.pos + 1
+        n.kind = nEol
+    } else if b == 92 { // '\'
+        p.pos = p.pos + 1
+        nn, ok := parseEscape(p)
+        if !ok {
+            return n, false
+        }
+        n = nn
+    } else {
+        r, size := unicode.DecodeRune(p.pat, p.pos)
+        if size < 1 {
+            size = 1
+        }
+        p.pos = p.pos + size
+        n.kind = nLit
+        n.r = r
+    }
+
+    // quantifier
+    b = peekByte(p)
+    if b == 42 { // '*'
+        p.pos = p.pos + 1
+        n.min = 0
+        n.max = inf
+        skipLazy(p)
+    } else if b == 43 { // '+'
+        p.pos = p.pos + 1
+        n.min = 1
+        n.max = inf
+        skipLazy(p)
+    } else if b == 63 { // '?'
+        p.pos = p.pos + 1
+        n.min = 0
+        n.max = 1
+        skipLazy(p)
+    } else if b == 123 { // '{'
+        lo, hi, ok := parseBounds(p)
+        if ok {
+            n.min = lo
+            n.max = hi
+            skipLazy(p)
+        } else {
+            // '{' was a literal brace — leave it; rare in our patterns.
+            n.kind = nLit
+            n.r = 123
+            n.min = 1
+            n.max = 1
+            p.pos = p.pos + 1
+        }
+    }
+    return n, true
+}
+
+// skipLazy consumes a trailing '?' making a quantifier lazy — we treat it as
+// greedy anyway since only anchored, whole-pattern uses need care.
+fn skipLazy(p: *parser) {
+    if peekByte(p) == 63 {
+        p.pos = p.pos + 1
+    }
+}
+
+// parseBounds parses {m}, {m,}, {m,n}. Returns ok=false if not a bounds
+// construct.
+fn parseBounds(p: *parser) -> (int, int, bool) {
+    save := p.pos
+    p.pos = p.pos + 1 // '{'
+    lo := 0
+    hasLo := false
+    for peekByte(p) >= 48 && peekByte(p) <= 57 {
+        lo = lo * 10 + (takeByte(p) - 48)
+        hasLo = true
+    }
+    if !hasLo {
+        p.pos = save
+        return 0, 0, false
+    }
+    if peekByte(p) == 125 { // '}'
+        p.pos = p.pos + 1
+        return lo, lo, true
+    }
+    if peekByte(p) != 44 { // ','
+        p.pos = save
+        return 0, 0, false
+    }
+    p.pos = p.pos + 1
+    if peekByte(p) == 125 {
+        p.pos = p.pos + 1
+        return lo, inf, true
+    }
+    hi := 0
+    hasHi := false
+    for peekByte(p) >= 48 && peekByte(p) <= 57 {
+        hi = hi * 10 + (takeByte(p) - 48)
+        hasHi = true
+    }
+    if !hasHi || peekByte(p) != 125 {
+        p.pos = save
+        return 0, 0, false
+    }
+    p.pos = p.pos + 1
+    return lo, hi, true
+}
+
+// parseEscape parses the element after a backslash.
+fn parseEscape(p: *parser) -> (Node, bool) {
+    n := Node{min: 1, max: 1}
+    if p.pos >= str.Len(p.pat) {
+        p.err = "trailing backslash"
+        return n, false
+    }
+    c := takeByte(p)
+    if c == 98 { // \b
+        n.kind = nWB
+    } else if c == 66 { // \B
+        n.kind = nNWB
+    } else if c == 100 || c == 68 { // \d \D
+        n.kind = nClass
+        n.classLo = []int{48, 57}
+        n.negated = c == 68
+    } else if c == 119 || c == 87 { // \w \W
+        n.kind = nClass
+        n.classLo = []int{48, 57, 65, 90, 95, 95, 97, 122}
+        n.negated = c == 87
+    } else if c == 115 || c == 83 { // \s \S
+        n.kind = nClass
+        n.classLo = []int{9, 10, 12, 13, 32, 32}
+        n.negated = c == 83
+    } else if c == 112 || c == 80 { // \p{...} \P{...}
+        if peekByte(p) != 123 {
+            p.err = "expected \\p{...}"
+            return n, false
+        }
+        p.pos = p.pos + 1
+        name := ""
+        for peekByte(p) != 125 && peekByte(p) >= 0 {
+            name = str.Concat(name, str.Substr(p.pat, p.pos, 1))
+            p.pos = p.pos + 1
+        }
+        if peekByte(p) != 125 {
+            p.err = "unclosed \\p{...}"
+            return n, false
+        }
+        p.pos = p.pos + 1
+        n.kind = nClass
+        n.classLo = classFor(name, p)
+        n.negated = c == 80
+        if p.err != "" {
+            return n, false
+        }
+    } else {
+        // Escaped literal.
+        n.kind = nLit
+        n.r = c
+    }
+    return n, true
+}
+
+// classFor maps a \p{...} name to rune ranges handled specially at match
+// time. We encode them as magic range pairs: negative lo means "use the
+// predicate -lo".
+fn classFor(name: string, p: *parser) -> []int {
+    if name == "L" {
+        return []int{-1, -1} // unicode.IsLetter
+    }
+    if name == "N" {
+        return []int{-2, -2} // unicode.IsNumber
+    }
+    p.err = str.Concat("unsupported \\p{", str.Concat(name, "}"))
+    return []int{}
+}
+
+// parseClass parses [a-z...] including negation.
+fn parseClass(p: *parser) -> (Node, bool) {
+    n := Node{kind: nClass, min: 1, max: 1}
+    p.pos = p.pos + 1 // '['
+    if peekByte(p) == 94 {
+        n.negated = true
+        p.pos = p.pos + 1
+    }
+    for p.pos < str.Len(p.pat) && peekByte(p) != 93 {
+        r, size := unicode.DecodeRune(p.pat, p.pos)
+        if size < 1 {
+            size = 1
+        }
+        p.pos = p.pos + size
+        if p.pos < str.Len(p.pat) && p.pat[p.pos] == 45 &&
+            p.pos + 1 < str.Len(p.pat) && p.pat[p.pos + 1] != 93 {
+            p.pos = p.pos + 1
+            r2, size2 := unicode.DecodeRune(p.pat, p.pos)
+            if size2 < 1 {
+                size2 = 1
+            }
+            p.pos = p.pos + size2
+            n.classLo = append(n.classLo, r)
+            n.classLo = append(n.classLo, r2)
+        } else {
+            n.classLo = append(n.classLo, r)
+            n.classLo = append(n.classLo, r)
+        }
+    }
+    if peekByte(p) != 93 {
+        p.err = "unclosed class"
+        return n, false
+    }
+    p.pos = p.pos + 1
+    return n, true
+}
+
+// --- matching -------------------------------------------------------------------
+
+// isWordRuneM — regexp \w: [0-9A-Za-z_].
+fn isWordRuneM(r: int) -> bool {
+    return (r >= 48 && r <= 57) || (r >= 65 && r <= 90) ||
+        (r >= 97 && r <= 122) || r == 95
+}
+
+// runeAt decodes the rune at byte offset i, or (-1,0) at the end.
+fn runeAt(s: string, i: int) -> (int, int) {
+    if i >= str.Len(s) {
+        return -1, 0
+    }
+    r, sz := unicode.DecodeRune(s, i)
+    if sz < 1 {
+        sz = 1
+    }
+    return r, sz
+}
+
+// prevRuneEnd returns the rune ending at byte i, i.e. the rune just before i.
+fn prevRune(s: string, i: int) -> int {
+    if i <= 0 {
+        return -1
+    }
+    r, _ := unicode.DecodeLastRune(s, i)
+    return r
+}
+
+// inClass reports whether r satisfies the node class.
+fn inClass(n: *Node, r: int) -> bool {
+    if r < 0 {
+        return false
+    }
+    hit := false
+    for i := 0; i + 1 < len(n.classLo); i = i + 2 {
+        lo := n.classLo[i]
+        hi := n.classLo[i + 1]
+        if lo < 0 {
+            pred := -lo
+            if pred == 1 && unicode.IsLetter(r) {
+                hit = true
+            }
+            if pred == 2 && unicode.IsNumber(r) {
+                hit = true
+            }
+        } else if r >= lo && r <= hi {
+            hit = true
+        }
+    }
+    if n.negated {
+        return !hit
+    }
+    return hit
+}
+
+// runeEq compares two runes, honoring the case-insensitive flag.
+fn runeEq(ci: bool, a: int, b: int) -> bool {
+    if a == b {
+        return true
+    }
+    if ci {
+        return unicode.ToLower(a) == unicode.ToLower(b)
+    }
+    return false
+}
+
+// matchSeq returns the first end position (in PCRE backtracking: order) at
+// which seq[ni:] matches starting at byte pos, or -1.
+fn matchSeq(p: *Pattern, seq: []Node, ni: int, s: string, pos: int) -> int {
+    if ni >= len(seq) {
+        return pos
+    }
+    n := seq[ni]
+
+    // Zero-width predicates first: they have no quantifier effect beyond
+    // pass/fail (quantifiers on them are: ignored, as in most: engines).
+    if n.kind == nBol {
+        if pos == 0 {
+            return matchSeq(p, seq, ni + 1, s, pos)
+        }
+        return -1
+    }
+    if n.kind == nEol {
+        if pos == str.Len(s) {
+            return matchSeq(p, seq, ni + 1, s, pos)
+        }
+        return -1
+    }
+    if n.kind == nWB || n.kind == nNWB {
+        before := isWordRuneM(prevRune(s, pos))
+        cur, _ := runeAt(s, pos)
+        after := isWordRuneM(cur)
+        boundary := before != after
+        if (n.kind == nWB && boundary) || (n.kind == nNWB && !boundary) {
+            return matchSeq(p, seq, ni + 1, s, pos)
+        }
+        return -1
+    }
+
+    // Repetition: consume greedily, backtrack to fewer reps.
+    var ends []int
+    repEnds(p, &n, s, pos, 0, &ends)
+    for i := 0; i < len(ends); i = i + 1 {
+        e := matchSeq(p, seq, ni + 1, s, ends[i])
+        if e >= 0 {
+            return e
+        }
+    }
+    return -1
+}
+
+// repEnds collects, greedy-first, the positions reachable by consuming the
+// node's atom between min and max times, with the last element corresponding
+// to the minimum count.
+fn repEnds(p: *Pattern, n: *Node, s: string, pos: int, count: int, out: *[]int) {
+    // Recursion: after each atom match we may stop (if count >= min) or
+    // continue. Collect in greedy order — deepest consumption first.
+    if count >= n.min {
+        // Try consuming more first (greedy), then record this stop.
+        if count < n.max {
+            tryMore(p, n, s, pos, count, out)
+        }
+        *out = append(*out, pos)
+        return
+    }
+    if count < n.max {
+        tryMore(p, n, s, pos, count, out)
+    }
+}
+
+// tryMore matches the atom once more at pos and continues.
+fn tryMore(p: *Pattern, n: *Node, s: string, pos: int, count: int, out: *[]int) {
+    nxt := matchOne(p, n, s, pos)
+    for i := 0; i < len(nxt); i = i + 1 {
+        if nxt[i] == pos {
+            // A zero-width atom match ends the repetition, as in standard
+            // engines — otherwise (x?)* would loop forever.
+            if count + 1 >= n.min {
+                *out = append(*out, pos)
+            }
+            continue
+        }
+        repEnds(p, n, s, nxt[i], count + 1, out)
+    }
+}
+
+// matchOne returns the byte positions reachable by a single application of
+// the node's atom (groups may have: several).
+fn matchOne(p: *Pattern, n: *Node, s: string, pos: int) -> []int {
+    var out []int
+    if n.kind == nLit {
+        r, sz := runeAt(s, pos)
+        if r >= 0 && runeEq(p.ci, r, n.r) {
+            out = append(out, pos + sz)
+        }
+        return out
+    }
+    if n.kind == nAny {
+        _, sz := runeAt(s, pos)
+        if sz > 0 {
+            out = append(out, pos + sz)
+        }
+        return out
+    }
+    if n.kind == nClass {
+        r, sz := runeAt(s, pos)
+        if r >= 0 && inClass(n, r) {
+            out = append(out, pos + sz)
+        }
+        return out
+    }
+    if n.kind == nGroup {
+        for a := 0; a < len(n.alts); a = a + 1 {
+            e := matchSeq(p, n.alts[a], 0, s, pos)
+            if e >= 0 {
+                out = append(out, e)
+            }
+        }
+        return out
+    }
+    return out
+}
+
+// --- public API -------------------------------------------------------------------
+
+// MatchAt returns the end position of a match anchored exactly at byte
+// start, or -1.
+pub fn MatchAt(p: *Pattern, s: string, start: int) -> int {
+    for a := 0; a < len(p.alts); a = a + 1 {
+        e := matchSeq(p, p.alts[a], 0, s, start)
+        if e >= 0 {
+            return e
+        }
+    }
+    return -1
+}
+
+// Find returns the (start,end) of the leftmost match, or (-1,-1).
+pub fn Find(p: *Pattern, s: string) -> (int, int) {
+    i := 0
+    n := str.Len(s)
+    for i <= n {
+        for a := 0; a < len(p.alts); a = a + 1 {
+            e := matchSeq(p, p.alts[a], 0, s, i)
+            if e >= 0 {
+                return i, e
+            }
+        }
+        if i < n {
+            _, sz := runeAt(s, i)
+            i = i + sz
+        } else {
+            break
+        }
+    }
+    return -1, -1
+}
+
+// Match reports whether the pattern matches anywhere in s.
+pub fn Match(p: *Pattern, s: string) -> bool {
+    a, _ := Find(p, s)
+    return a >= 0
+}
+
+// Span is a (start,end) byte pair describing one match.
+pub struct Span {
+    Start: int
+    End:   int
+}
+
+// FindAll returns every non-overlapping match, in order.
+pub fn FindAll(p: *Pattern, s: string) -> []Span {
+    var out []Span
+    i := 0
+    n := str.Len(s)
+    for i <= n {
+        a, e := findFrom(p, s, i)
+        if a < 0 {
+            break
+        }
+        out = append(out, Span{Start: a, End: e})
+        if e == a {
+            // Empty match — advance one rune.
+            if e < n {
+                _, sz := runeAt(s, e)
+                i = e + sz
+            } else {
+                break
+            }
+        } else {
+            i = e
+        }
+    }
+    return out
+}
+
+// findFrom returns the leftmost match at or after byte fromPos.
+fn findFrom(p: *Pattern, s: string, fromPos: int) -> (int, int) {
+    i := fromPos
+    n := str.Len(s)
+    for i <= n {
+        for a := 0; a < len(p.alts); a = a + 1 {
+            e := matchSeq(p, p.alts[a], 0, s, i)
+            if e >= 0 {
+                return i, e
+            }
+        }
+        if i < n {
+            _, sz := runeAt(s, i)
+            i = i + sz
+        } else {
+            break
+        }
+    }
+    return -1, -1
+}
+
+// FullMatch reports whether the pattern matches all of s.
+pub fn FullMatch(p: *Pattern, s: string) -> bool {
+    for a := 0; a < len(p.alts); a = a + 1 {
+        e := matchSeq(p, p.alts[a], 0, s, 0)
+        if e == str.Len(s) {
+            return true
+        }
+    }
+    return false
+}
+
+// DebugDescribe returns a compact dump of the parsed pattern — for testing.
+pub fn DebugDescribe(p: *Pattern) -> string {
+    var b str.Builder
+    for a := 0; a < len(p.alts); a = a + 1 {
+        if a > 0 {
+            b.Write("|")
+        }
+        describeSeq(&b, p.alts[a])
+    }
+    return b.String()
+}
+
+fn describeSeq(b: *str.Builder, seq: []Node) {
+    for i := 0; i < len(seq); i = i + 1 {
+        n := seq[i]
+        b.Write("[")
+        b.Write(strconv.Itoa(n.kind))
+        b.Write(":")
+        b.Write(strconv.Itoa(n.r))
+        b.Write("{")
+        b.Write(strconv.Itoa(n.min))
+        b.Write(",")
+        b.Write(strconv.Itoa(n.max))
+        b.Write("}]")
+    }
+}

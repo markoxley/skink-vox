@@ -1,0 +1,131 @@
+// File:    ner_test.skink
+// Purpose: Unit tests for ner — the maxent entity extracter, Label/Chunk,
+//          Entity offsets, and model loading paths.
+module ner_test
+
+import "ner"
+import "tag"
+import "tokenize"
+import "std/fs"
+import "std/json"
+import "std/libc"
+import "std/str"
+import "testing"
+
+// labelAndChunk runs the full POS+NER pipeline over src.
+fn labelAndChunk(src: string) -> []ner.Entity {
+    tg, _ := tag.New()
+    ex, _ := ner.New()
+    tk := tokenize.NewTokenizer()
+    toks := tk.Tokenize(src)
+    tg.TagTokens(toks)
+    ex.Label(toks)
+    return ex.Chunk(src, toks)
+}
+
+// TestKnownEntities checks reference-verified entities.
+pub fn TestKnownEntities() {
+    ents := labelAndChunk("My name is Jonas.")
+    testing.AssertTrue(len(ents) == 1, "one entity")
+    if len(ents) == 1 {
+        testing.AssertEqualString("Jonas", ents[0].Text, "entity text")
+        testing.AssertEqualString("GPE", ents[0].Label, "entity label")
+        testing.AssertEqualInt(11, ents[0].Start, "entity start")
+        testing.AssertEqualInt(16, ents[0].End(), "entity end")
+    }
+}
+
+// TestEntitySpan checks the Entity position invariant.
+pub fn TestEntitySpan() {
+    src := "Marie Curie studied in Paris."
+    ents := labelAndChunk(src)
+    testing.AssertTrue(len(ents) > 0, "entities found")
+    for i := 0; i < len(ents); i = i + 1 {
+        e := ents[i]
+        testing.AssertEqualString(e.Text, e.In(src), "entity offset invariant")
+        testing.AssertTrue(e.End() <= str.Len(src), "end in bounds")
+    }
+}
+
+// TestNoEntities checks text without entities.
+pub fn TestNoEntities() {
+    ents := labelAndChunk("the quick brown fox jumps over")
+    testing.AssertTrue(len(ents) == 0, "no entities")
+}
+
+// TestEmptyInput checks empty token input to Label/Chunk.
+pub fn TestEmptyInput() {
+    ex, _ := ner.New()
+    var toks []tokenize.Token
+    ex.Label(toks)
+    ents := ex.Chunk("", toks)
+    testing.AssertTrue(len(ents) == 0, "empty stays empty")
+}
+
+// TestFromBytes checks loading the model from memory, plus corrupt input.
+pub fn TestFromBytes() {
+    path := "models/ner/en.bin"
+    size := int(fs.FileSize(path))
+    f, ferr := fs.Open(path, "rb")
+    testing.AssertEqualString("", ferr.message, "open model")
+    data := libc.malloc(size)
+    n := f.Read(data, size)
+    f.Close()
+    testing.AssertTrue(n == size, "read all")
+    ex, terr := ner.FromBytes(data, size)
+    testing.AssertEqualString("", terr.message, "FromBytes")
+
+    tg, _ := tag.New()
+    src := "Hello World."
+    tk := tokenize.NewTokenizer()
+    toks := tk.Tokenize(src)
+    tg.TagTokens(toks)
+    ex.Label(toks)
+    ents := ex.Chunk(src, toks)
+    testing.AssertTrue(len(ents) == 1, "loaded model works")
+    if len(ents) == 1 {
+        testing.AssertEqualString("Hello World", ents[0].Text, "entity")
+    }
+
+    _, bad := ner.FromBytes("garbage", 7)
+    testing.AssertTrue(bad.message != "", "corrupt model rejected")
+}
+
+// TestFromFile checks the file loading path and missing-file error.
+pub fn TestFromFile() {
+    _, err := ner.FromFile("models/ner/en.bin")
+    testing.AssertEqualString("", err.message, "FromFile")
+    _, missing := ner.FromFile("models/ner/nope.bin")
+    testing.AssertTrue(missing.message != "", "missing file rejected")
+}
+
+// TestCorpus checks every corpus input's entity list against the reference
+// goldens in ner_golden.json.
+pub fn TestCorpus() {
+    data, err := fs.ReadAll("testdata/ner_golden.json")
+    testing.AssertEqualString("", err.message, "read golden")
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, "parse golden")
+    n := json.ObjectLen(v)
+    testing.AssertTrue(n > 0, "corpus nonempty")
+    for i := 0; i < n; i = i + 1 {
+        src, wantArr := json.ObjectGetByIndex(v, i)
+        ents := labelAndChunk(src)
+        wn := json.ArrayLen(wantArr)
+        if len(ents) != wn {
+            testing.Errorf(str.Concat("ner count mismatch on: ", src))
+            continue
+        }
+        for j := 0; j < wn; j = j + 1 {
+            e := ents[j]
+            w := json.ArrayGet(wantArr, j)
+            wt := json.AsString(json.ArrayGet(w, 0))
+            wl := json.AsString(json.ArrayGet(w, 1))
+            ws := int(json.AsNumber(json.ArrayGet(w, 2)))
+            we := int(json.AsNumber(json.ArrayGet(w, 3)))
+            if e.Text != wt || e.Label != wl || e.Start != ws || e.End() != we {
+                testing.Errorf(str.Concat("ner mismatch on: ", str.Concat(src, str.Concat(" got ", e.Text))))
+            }
+        }
+    }
+}

@@ -1,0 +1,208 @@
+// File:    skink_vox_test.skink
+// Purpose: Regression tests for skink-vox. Every expected value here was
+//          produced by the reference implementation over its shipped test
+//          corpus and confirmed byte-identical via the dump.skink
+//          differential harness.
+module skink_vox_test
+
+import "ner"
+import "vox"
+import "segment"
+import "strcase"
+import "summarize"
+import "tag"
+import "tokenize"
+import "std/str"
+import "testing"
+
+// TestTokenize checks the default tokenizer's word and punctuation splits
+// against reference output.
+pub fn TestTokenize() {
+    tk := tokenize.NewTokenizer()
+    toks := tk.Tokenize("They'll save and invest more.")
+    testing.AssertTrue(len(toks) == 7, "tok count")
+    want := []string{"They", "'ll", "save", "and", "invest", "more", "."}
+    for i := 0; i < len(want); i = i + 1 {
+        testing.AssertEqualString(want[i], toks[i].Text, "tok")
+    }
+}
+
+// TestTokenOffsets guards the position invariant src[t.Start:t.End()] ==
+// t.Text.
+pub fn TestTokenOffsets() {
+    tk := tokenize.NewTokenizer()
+    src := "They'll save and invest more."
+    toks := tk.Tokenize(src)
+    wantStart := []int{0, 4, 8, 13, 17, 24, 28}
+    for i := 0; i < len(toks); i = i + 1 {
+        testing.AssertEqualInt(wantStart[i], toks[i].Start, "start")
+        testing.AssertEqualString(toks[i].Text, toks[i].In(src), "slice")
+    }
+    testing.AssertEqualInt(29, toks[6].End(), "end offset")
+}
+
+// TestTreebank checks the Penn Treebank word tokenizer.
+pub fn TestTreebank() {
+    tb := tokenize.NewTreebankWordTokenizer()
+    words := tb.Tokenize("They'll save and invest more.")
+    testing.AssertTrue(len(words) == 7, "treebank count")
+    testing.AssertEqualString("'ll", words[1], "contraction")
+}
+
+// TestSegment checks Punkt sentence segmentation and sentence offsets.
+pub fn TestSegment() {
+    seg, err := segment.New()
+    testing.AssertEqualString("", err.message, "segmenter load")
+    src := "Hello World. My name is Jonas."
+    sents := seg.Segment(src)
+    testing.AssertTrue(len(sents) == 2, "sentence count")
+    testing.AssertEqualString("Hello World.", sents[0].Text, "sent 0")
+    testing.AssertEqualString("My name is Jonas.", sents[1].Text, "sent 1")
+    testing.AssertEqualInt(0, sents[0].Start, "start 0")
+    testing.AssertEqualInt(13, sents[1].Start, "start 1")
+    testing.AssertEqualString("My name is Jonas.", sents[1].In(src), "slice")
+}
+
+// TestTag checks perceptron POS tags.
+pub fn TestTag() {
+    tg, err := tag.New()
+    testing.AssertEqualString("", err.message, "tagger load")
+    toks := tg.Tag([]string{"They", "'ll", "save", "and", "invest", "more", "."})
+    want := []string{"PRP", "MD", "VB", "CC", "VB", "JJR", "."}
+    for i := 0; i < len(want); i = i + 1 {
+        testing.AssertEqualString(want[i], toks[i].Tag, "tag")
+    }
+}
+
+// TestNER checks entity labels and spans after tagging.
+pub fn TestNER() {
+    tg, _ := tag.New()
+    ex, err := ner.New()
+    testing.AssertEqualString("", err.message, "ner load")
+    src := "My name is Jonas."
+    tk := tokenize.NewTokenizer()
+    toks := tk.Tokenize(src)
+    tg.TagTokens(toks)
+    ex.Label(toks)
+    ents := ex.Chunk(src, toks)
+    testing.AssertTrue(len(ents) == 1, "entity count")
+    testing.AssertEqualString("Jonas", ents[0].Text, "entity text")
+    testing.AssertEqualString("GPE", ents[0].Label, "entity label")
+    testing.AssertEqualInt(11, ents[0].Start, "entity start")
+    testing.AssertEqualInt(16, ents[0].End(), "entity end")
+}
+
+// TestTitleAP checks AP-style title conversion.
+pub fn TestTitleAP() {
+    tc := strcase.NewTitleConverter(strcase.APStyle)
+    testing.AssertEqualString("Follow Step-by-Step Instructions",
+        tc.Convert("follow step-by-step instructions"), "AP title")
+    testing.AssertEqualString("Catchy Title: A Subtitle",
+        tc.Convert("catchy title: a subtitle"), "AP subtitle")
+}
+
+// TestTitleChicago checks Chicago-style title conversion.
+pub fn TestTitleChicago() {
+    tc := strcase.NewTitleConverter(strcase.ChicagoStyle)
+    testing.AssertEqualString("This Sub-Phrase Is Nice",
+        tc.Convert("this sub-phrase is nice"), "Chicago title")
+}
+
+// TestWordCases checks the mechanical converters.
+pub fn TestWordCases() {
+    testing.AssertEqualString("fooBarBaz", strcase.Camel("foo_bar_baz"), "camel")
+    testing.AssertEqualString("FooBarBaz", strcase.Pascal("foo_bar_baz"), "pascal")
+    testing.AssertEqualString("foo-bar-baz", strcase.Dash("foo_bar_baz"), "dash")
+    testing.AssertEqualString("FOO_BAR_BAZ", strcase.Constant("fooBarBaz"), "constant")
+}
+
+// TestSyllables checks syllable counts including corner cases.
+pub fn TestSyllables() {
+    testing.AssertEqualInt(4, summarize.Syllables("abalone"), "abalone")
+    testing.AssertEqualInt(2, summarize.Syllables("people"), "people")
+    testing.AssertEqualInt(3, summarize.Syllables("summary"), "summary")
+    testing.AssertEqualInt(1, summarize.Syllables("xy"), "xy")
+}
+
+// TestSummarize checks document metrics on a fixed input.
+pub fn TestSummarize() {
+    doc := summarize.NewDocument("The cat sat on the mat. It was happy.")
+    testing.AssertEqualFloat(2.0, doc.NumSentences, "sentences")
+    testing.AssertEqualFloat(9.0, doc.NumWords, "words")
+    a := doc.Assess()
+    testing.AssertTrue(a.ReadingEase > 0.0, "reading ease computed")
+}
+
+// TestTokenizerOptions checks the Using* option functions.
+pub fn TestTokenizerOptions() {
+    // An empty split-case list leaves contractions whole.
+    tk := tokenize.NewTokenizerOpts([]fn(*tokenize.Tokenizer){
+        tokenize.UsingSplitCases([]string{}),
+    })
+    toks := tk.Tokenize("They'll save us.")
+    testing.AssertEqualString("They'll", toks[0].Text, "unsplit contraction")
+
+    // Custom affixes split off the token ends.
+    tk2 := tokenize.NewTokenizerOpts([]fn(*tokenize.Tokenizer){
+        tokenize.UsingPrefixes([]string{"#"}),
+        tokenize.UsingSuffixes([]string{"!"}),
+    })
+    t2 := tk2.Tokenize("#hello world!")
+    testing.AssertEqualString("#", t2[0].Text, "prefix split")
+    testing.AssertEqualString("hello", t2[1].Text, "word")
+    testing.AssertEqualString("!", t2[len(t2) - 1].Text, "suffix split")
+}
+
+// TestLexicon checks that WithLexicon overrides model predictions.
+pub fn TestLexicon() {
+    lex := make(map[string]string)
+    lex["refactor"] = "NNP"
+    tg, err := tag.NewOpts([]fn(*tag.Tagger){tag.WithLexicon(lex)})
+    testing.AssertEqualString("", err.message, "tagger load")
+    toks := tg.Tag([]string{"please", "refactor", "this"})
+    testing.AssertEqualString("NNP", toks[1].Tag, "lexicon override")
+}
+
+// TestLexical checks the dictionary-driven tagger and ReadDictionary.
+pub fn TestLexical() {
+    entries, err := tag.ReadDictionary("cats\tNNS\nchased\tVBD\tVB\n")
+    testing.AssertEqualString("", err.message, "dictionary parse")
+    lx, lerr := tag.NewLexicalDefault(entries)
+    testing.AssertEqualString("", lerr.message, "lexical build")
+    toks := lx.Tag([]string{"the", "cats", "chased", "mice"})
+    testing.AssertEqualString("DT", toks[0].Tag, "fallback tag")
+    testing.AssertEqualString("NNS", toks[1].Tag, "single-tag entry")
+    testing.AssertEqualString("VBD", toks[2].Tag, "multi-tag via context")
+
+    // Incomplete lines are rejected.
+    _, bad := tag.ReadDictionary("cats\n")
+    testing.AssertTrue(bad.message != "", "incomplete line rejected")
+}
+
+// TestRegistry checks the tagger registry.
+pub fn TestRegistry() {
+    names := tag.Names()
+    found := false
+    for i := 0; i < len(names); i = i + 1 {
+        if names[i] == "perceptron" {
+            found = true
+        }
+    }
+    testing.AssertTrue(found, "perceptron registered")
+    _, err := tag.Open("perceptron")
+    testing.AssertEqualString("", err.message, "open perceptron")
+    _, err2 := tag.Open("bogus")
+    testing.AssertTrue(err2.message != "", "unknown tagger rejected")
+}
+
+// TestDocumentOptions checks the functional-option document pipeline.
+pub fn TestDocumentOptions() {
+    doc, err := vox.NewDocumentOptions("One two. Three four.", []fn(*vox.DocOpts){
+        vox.WithExtraction(false),
+        vox.WithTagging(false),
+    })
+    testing.AssertEqualString("", err.message, "document build")
+    testing.AssertTrue(len(doc.Tokens()) == 6, "token count")
+    testing.AssertTrue(len(doc.Sentences()) == 2, "sentence count")
+    testing.AssertTrue(len(doc.Entities()) == 0, "no entities")
+}

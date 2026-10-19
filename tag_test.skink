@@ -1,0 +1,205 @@
+// File:    tag_test.skink
+// Purpose: Unit tests for tag — the perceptron tagger, model loading paths,
+//          the lexicon option, the Lexical dictionary tagger, ReadDictionary,
+//          and the name registry.
+module tag_test
+
+import "tag"
+import "tokenize"
+import "internal/flat"
+import "std/json"
+import "std/fs"
+import "std/libc"
+import "std/str"
+import "std/errors"
+import "testing"
+
+// TestCorpus tags every corpus input and compares every tag against the
+// reference goldens in tag_golden.json, plus the offset invariant.
+pub fn TestCorpus() {
+    data, err := fs.ReadAll("testdata/tag_golden.json")
+    testing.AssertEqualString("", err.message, "read golden")
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, "parse golden")
+    tk := tokenize.NewTokenizer()
+    tg, terr := tag.New()
+    testing.AssertEqualString("", terr.message, "tagger load")
+    n := json.ObjectLen(v)
+    testing.AssertTrue(n > 0, "corpus nonempty")
+    for i := 0; i < n; i = i + 1 {
+        src, wantArr := json.ObjectGetByIndex(v, i)
+        toks := tk.Tokenize(src)
+        tg.TagTokens(toks)
+        wn := json.ArrayLen(wantArr)
+        if len(toks) != wn {
+            testing.Errorf(str.Concat("tag count mismatch on: ", src))
+            continue
+        }
+        for j := 0; j < wn; j = j + 1 {
+            want := json.AsString(json.ArrayGet(wantArr, j))
+            got := str.Concat(toks[j].Text, str.Concat(":", toks[j].Tag))
+            if got != want {
+                testing.Errorf(str.Concat("tag mismatch on: ", str.Concat(src, str.Concat(" at ", got))))
+            }
+            testing.AssertEqualString(toks[j].Text, toks[j].In(src), "offsets intact")
+        }
+    }
+}
+
+// TestKnownTags checks reference-verified tags for a fixed sentence.
+pub fn TestKnownTags() {
+    tg, _ := tag.New()
+    toks := tg.Tag([]string{"They", "'ll", "save", "and", "invest", "more", "."})
+    want := []string{"PRP", "MD", "VB", "CC", "VB", "JJR", "."}
+    testing.AssertTrue(len(toks) == len(want), "token count")
+    for i := 0; i < len(want); i = i + 1 {
+        testing.AssertEqualString(want[i], toks[i].Tag, "tag")
+    }
+}
+
+// TestName checks the tagger's registry name.
+pub fn TestName() {
+    tg, _ := tag.New()
+    testing.AssertEqualString("perceptron", tg.Name(), "name")
+    testing.AssertEqualString("perceptron", tag.Default, "Default constant")
+}
+
+// TestFromBytes checks loading a model from in-memory bytes, including the
+// corrupt-data error path.
+pub fn TestFromBytes() {
+    path := "models/tag/en.bin"
+    size := int(fs.FileSize(path))
+    f, ferr := fs.Open(path, "rb")
+    testing.AssertEqualString("", ferr.message, "open model")
+    buf := allocBytes(size)
+    n := f.Read(buf, size)
+    f.Close()
+    testing.AssertTrue(n == size, "read all")
+    tg, terr := tag.FromBytes(buf, size)
+    testing.AssertEqualString("", terr.message, "FromBytes")
+    toks := tg.Tag([]string{"hello", "world"})
+    testing.AssertTrue(toks[0].Tag != "", "tagged")
+
+    _, bad := tag.FromBytes("not a model", 11)
+    testing.AssertTrue(bad.message != "", "corrupt model rejected")
+}
+
+// TestFromFile checks the file loading path and its error handling.
+pub fn TestFromFile() {
+    tg, err := tag.FromFile("models/tag/en.bin")
+    testing.AssertEqualString("", err.message, "FromFile")
+    testing.AssertTrue(tg.Name() == "perceptron", "loaded tagger")
+
+    _, missing := tag.FromFile("models/tag/nope.bin")
+    testing.AssertTrue(missing.message != "", "missing file rejected")
+}
+
+// TestWithLexicon checks the functional option overrides predictions.
+pub fn TestWithLexicon() {
+    lex := make(map[string]string)
+    lex["refactor"] = "NNP"
+    tg, err := tag.NewOpts([]tag.Option{tag.WithLexicon(lex)})
+    testing.AssertEqualString("", err.message, "NewOpts")
+    toks := tg.Tag([]string{"please", "refactor", "this"})
+    testing.AssertEqualString("NNP", toks[1].Tag, "lexicon override")
+
+    // Lowercase lookup covers case variants.
+    toks2 := tg.Tag([]string{"Refactor"})
+    testing.AssertEqualString("NNP", toks2[0].Tag, "lexicon case-folded")
+}
+
+// TestReadDictionary checks the tab-separated dictionary parser, including
+// comments, blank lines, and the incomplete-line error.
+pub fn TestReadDictionary() {
+    entries, err := tag.ReadDictionary("# comment\n\ncats\tNNS\nchased\tVBD\tVB\n")
+    testing.AssertEqualString("", err.message, "parse")
+    testing.AssertTrue(len(entries) == 2, "two entries")
+
+    _, bad := tag.ReadDictionary("cats\n")
+    testing.AssertTrue(bad.message != "", "word-only line rejected")
+    _, bad2 := tag.ReadDictionary("\tNNS\n")
+    testing.AssertTrue(bad2.message != "", "empty word rejected")
+}
+
+// TestLexicalFromFile checks loading a dictionary from disk.
+pub fn TestLexicalFromFile() {
+    werr := fs.WriteAll("/tmp/skink-vox-lex.txt", "cats\tNNS\n")
+    testing.AssertEqualString("", werr.message, "write dict")
+    entries, err := tag.LexicalFromFile("/tmp/skink-vox-lex.txt")
+    testing.AssertEqualString("", err.message, "load dict")
+    testing.AssertTrue(len(entries) == 1, "one entry")
+
+    _, missing := tag.LexicalFromFile("/tmp/skink-vox-nope.txt")
+    testing.AssertTrue(missing.message != "", "missing file rejected")
+}
+
+// TestLexical checks the dictionary tagger: single tags apply directly,
+// unknown words fall back, multi-tag entries defer to context.
+pub fn TestLexical() {
+    entries, _ := tag.ReadDictionary("cats\tNNS\nchased\tVBD\tVB\n")
+    lx, err := tag.NewLexicalDefault(entries)
+    testing.AssertEqualString("", err.message, "NewLexicalDefault")
+    toks := lx.Tag([]string{"the", "cats", "chased", "mice"})
+    testing.AssertEqualString("DT", toks[0].Tag, "fallback")
+    testing.AssertEqualString("NNS", toks[1].Tag, "single tag")
+    testing.AssertEqualString("VBD", toks[2].Tag, "context pick")
+    testing.AssertEqualString("lexical", lx.Name(), "name")
+
+    // TagTokens works in place.
+    tk := tokenize.NewTokenizer()
+    t2 := tk.Tokenize("the cats chased mice")
+    lx.TagTokens(t2)
+    testing.AssertEqualString("NNS", t2[1].Tag, "TagTokens in place")
+}
+
+// TestLexicalErrors checks the empty-dictionary error paths.
+pub fn TestLexicalErrors() {
+    empty := make(map[string][]string)
+    fb, _ := tag.New()
+    _, err := tag.NewLexical(empty, fb)
+    testing.AssertTrue(err.message != "", "empty entries rejected")
+    _, err2 := tag.NewLexicalDefault(empty)
+    testing.AssertTrue(err2.message != "", "empty entries rejected (default)")
+}
+
+// TestRegistry checks Names/Open/Register.
+pub fn TestRegistry() {
+    names := tag.Names()
+    found := false
+    for i := 0; i < len(names); i = i + 1 {
+        if names[i] == "perceptron" {
+            found = true
+        }
+    }
+    testing.AssertTrue(found, "perceptron registered")
+
+    tg, err := tag.Open("perceptron")
+    testing.AssertEqualString("", err.message, "open")
+    testing.AssertEqualString("perceptron", tg.Name(), "opened name")
+
+    _, bad := tag.Open("no-such-tagger")
+    testing.AssertTrue(bad.message != "", "unknown name rejected")
+    testing.AssertTrue(str.IndexOf(bad.message, "perceptron") >= 0, "error lists names")
+
+    // Register adds a custom factory.
+    tag.Register("test-tagger", testTaggerFactory)
+    names2 := tag.Names()
+    found2 := false
+    for i := 0; i < len(names2); i = i + 1 {
+        if names2[i] == "test-tagger" {
+            found2 = true
+        }
+    }
+    testing.AssertTrue(found2, "registered custom tagger")
+}
+
+// testTaggerFactory builds an empty tagger for the registry test.
+fn testTaggerFactory() -> (tag.Interface, errors.Error) {
+    var t tag.Tagger
+    return &t, errors.None()
+}
+
+// allocBytes allocates a raw byte buffer for binary reads.
+fn allocBytes(size: int) -> string {
+    return libc.malloc(size)
+}

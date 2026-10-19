@@ -1,0 +1,76 @@
+// File:    internal/mathutil.skink
+// Purpose: The handful of statistics prose's readability metrics need,
+//          ported from the reference implementation's internal/mathutil.
+module mathutil
+
+import "std/math"
+
+// NaN returns the IEEE-754 not-a-number value (std/math does not export: one).
+pub fn NaN() -> float {
+    return 0.0 / 0.0
+}
+
+// IsNaN reports whether x is NaN (the only IEEE value that != itself).
+pub fn IsNaN(x: float) -> bool {
+    return x != x
+}
+
+// Mean returns the arithmetic mean of xs, or NaN if xs is empty.
+pub fn Mean(xs: []float) -> float {
+    if len(xs) == 0 {
+        return NaN()
+    }
+    sum := 0.0
+    for i := 0; i < len(xs); i = i + 1 {
+        sum = sum + xs[i]
+    }
+    return sum / float(len(xs))
+}
+
+// StdDev returns the population standard deviation of xs, or NaN if xs is
+// empty.
+//
+// Population rather than sample: readability formulas treat the text in hand
+// as the whole population, not a draw from a larger one.
+pub fn StdDev(xs: []float) -> float {
+    if len(xs) == 0 {
+        return NaN()
+    }
+    m := Mean(xs)
+    variance := 0.0
+    for i := 0; i < len(xs); i = i + 1 {
+        variance = variance + (xs[i] - m) * (xs[i] - m)
+    }
+    return math.Sqrt(variance / float(len(xs)))
+}
+
+// Round rounds x to the given number of decimal places, with halves rounded
+// away from zero.
+//
+// Note that this is not a plain whole-number round scaled up: that approach
+// changes which way exact halves go for negative input.
+pub fn Round(x: float, places: int) -> float {
+    if IsNaN(x) {
+        return NaN()
+    }
+
+    sign := 1.0
+    if x < 0.0 {
+        sign = -1.0
+        x = -x
+    }
+
+    precision := math.Pow(10.0, float(places))
+    digit := x * precision
+
+    decimal := digit - math.Floor(digit)
+
+    var rounded float
+    if decimal >= 0.5 {
+        rounded = math.Ceil(digit)
+    } else {
+        rounded = math.Floor(digit)
+    }
+
+    return rounded / precision * sign
+}

@@ -1,0 +1,29 @@
+// File:    internal/emoticon.skink
+// Purpose: Emoticon set shared by the tokenizer and tagger, ported from the
+//          reference implementation. It lives in one place so the tagger
+//          (which tags these: SYM) and the tokenizer (which must keep them
+//          whole) cannot drift apart.
+module emoticon
+
+import "internal/emoticon_data"
+import "std/hashmap"
+
+var emotSet = hashmap.New<string, int>()
+var loaded = false
+
+// ensure builds the lookup set on first use.
+fn ensure() {
+    if loaded {
+        return
+    }
+    for i := 0; i < len(emoticon_data.Emoticons); i = i + 1 {
+        emotSet.Put(emoticon_data.Emoticons[i], 1)
+    }
+    loaded = true
+}
+
+// Is reports whether s is a known emoticon.
+pub fn Is(s: string) -> bool {
+    ensure()
+    return emotSet.Has(s)
+}

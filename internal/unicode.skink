@@ -1,0 +1,345 @@
+// File:    internal/unicode.skink
+// Purpose: Unicode helpers needed by the prose port: UTF-8 decoding and
+//          Unicode general-category / case-mapping operations backed by the
+//          generated tables in unicode_data.skink.
+//
+//          The tables mirror the reference implementation's categories
+//          (letter, number, white: space, upper, lower, title) and case
+//          mappings byte-for-byte, so rune-level decisions match exactly.
+module unicode
+
+import "internal/unicode_data"
+import "std/str"
+
+// ReplacementChar is returned when a byte sequence is not valid UTF-8.
+pub var ReplacementChar = 65533
+
+// DecodeRune decodes the first UTF-8 rune starting at byte offset i of s.
+// Returns (rune, size); size is 0 only when i >= len(s). Invalid input yields
+// (ReplacementChar, 1), matching the usual UTF-8 decoding contract.
+pub fn DecodeRune(s: string, i: int) -> (int, int) {
+    n := str.Len(s)
+    if i >= n {
+        return 0, 0
+    }
+    b0 := s[i]
+    if b0 < 128 {
+        return b0, 1
+    }
+    if b0 >= 194 && b0 < 224 {
+        if i + 1 < n && s[i + 1] >= 128 && s[i + 1] < 192 {
+            return ((b0 & 31) << 6) | (s[i + 1] & 63), 2
+        }
+        return ReplacementChar, 1
+    }
+    if b0 >= 224 && b0 < 240 {
+        if i + 2 < n &&
+            s[i + 1] >= 128 && s[i + 1] < 192 &&
+            s[i + 2] >= 128 && s[i + 2] < 192 {
+            return ((b0 & 15) << 12) | ((s[i + 1] & 63) << 6) | (s[i + 2] & 63), 3
+        }
+        return ReplacementChar, 1
+    }
+    if b0 >= 240 && b0 < 245 {
+        if i + 3 < n &&
+            s[i + 1] >= 128 && s[i + 1] < 192 &&
+            s[i + 2] >= 128 && s[i + 2] < 192 &&
+            s[i + 3] >= 128 && s[i + 3] < 192 {
+            return ((b0 & 7) << 18) | ((s[i + 1] & 63) << 12) |
+                ((s[i + 2] & 63) << 6) | (s[i + 3] & 63), 4
+        }
+        return ReplacementChar, 1
+    }
+    return ReplacementChar, 1
+}
+
+// DecodeLastRune decodes the last UTF-8 rune ending at byte offset end of s.
+// Returns (rune, size); invalid input yields (ReplacementChar, 1).
+pub fn DecodeLastRune(s: string, end: int) -> (int, int) {
+    if end <= 0 {
+        return 0, 0
+    }
+    start := end - 1
+    // Walk back over continuation bytes.
+    lim := end - 4
+    if lim < 0 {
+        lim = 0
+    }
+    for start > lim && s[start] >= 128 && s[start] < 192 {
+        start = start - 1
+    }
+    r, size := DecodeRune(s, start)
+    if start + size != end {
+        // Truncated or invalid sequence at the end.
+        return ReplacementChar, 1
+    }
+    return r, size
+}
+
+// RuneCount returns the number of runes in s.
+pub fn RuneCount(s: string) -> int {
+    count := 0
+    i := 0
+    n := str.Len(s)
+    for i < n {
+        _, size := DecodeRune(s, i)
+        if size < 1 {
+            size = 1
+        }
+        i = i + size
+        count = count + 1
+    }
+    return count
+}
+
+// inRanges reports whether r is covered by a (lo, hi, stride) range table.
+// The tables are sorted by lo, so a binary search would also work; a scan
+// with early exit keeps the code simple and fast enough for these sizes.
+fn inRanges(table: []int, r: int) -> bool {
+    i := 0
+    n := len(table)
+    for i < n {
+        lo := table[i]
+        hi := table[i + 1]
+        if r < lo {
+            return false
+        }
+        if r <= hi {
+            stride := table[i + 2]
+            return stride == 1 || (r - lo) % stride == 0
+        }
+        i = i + 3
+    }
+    return false
+}
+
+// IsSpace reports whether r is a Unicode White_Space character.
+pub fn IsSpace(r: int) -> bool {
+    // Fast path for the common ASCII whitespace set.
+    if r == 32 || (r >= 9 && r <= 13) {
+        return true
+    }
+    if r < 128 {
+        return false
+    }
+    return inRanges(unicode_data.SpaceRanges, r)
+}
+
+// IsLetter reports whether r is a Unicode letter (category: L).
+pub fn IsLetter(r: int) -> bool {
+    if r < 128 {
+        return (r >= 65 && r <= 90) || (r >= 97 && r <= 122)
+    }
+    return inRanges(unicode_data.LetterRanges, r)
+}
+
+// IsNumber reports whether r is a Unicode number (category: N).
+pub fn IsNumber(r: int) -> bool {
+    if r < 128 {
+        return r >= 48 && r <= 57
+    }
+    return inRanges(unicode_data.NumberRanges, r)
+}
+
+// IsUpper reports whether r is an upper-case letter.
+pub fn IsUpper(r: int) -> bool {
+    if r < 128 {
+        return r >= 65 && r <= 90
+    }
+    return inRanges(unicode_data.UpperRanges, r)
+}
+
+// IsLower reports whether r is a lower-case letter.
+pub fn IsLower(r: int) -> bool {
+    if r < 128 {
+        return r >= 97 && r <= 122
+    }
+    return inRanges(unicode_data.LowerRanges, r)
+}
+
+// IsTitle reports whether r is a title-case letter.
+pub fn IsTitle(r: int) -> bool {
+    if r < 128 {
+        return r >= 65 && r <= 90
+    }
+    return inRanges(unicode_data.TitleRanges, r)
+}
+
+// maxRune is the largest valid Unicode code point.
+var maxRune = 1114111
+
+// caseDelta maps r through one column of the case-range table. _case is
+// 0=upper, 1=lower, 2=title — matching the generated triple ordering.
+fn caseDelta(r: int, which: int) -> int {
+    table := unicode_data.CaseRanges
+    n := len(table) / 5
+    lo := 0
+    hi := n
+    for lo < hi {
+        m := (lo + hi) / 2
+        base := m * 5
+        crLo := table[base]
+        crHi := table[base + 1]
+        if r >= crLo && r <= crHi {
+            delta := table[base + 2 + which]
+            if delta > maxRune {
+                // Upper/Lower sequence: the rune's own offset, low bit
+                // replaced by the case selector.
+                return crLo + (((r - crLo) & -2) | (which & 1))
+            }
+            return r + delta
+        }
+        if r < crLo {
+            hi = m
+        } else {
+            lo = m + 1
+        }
+    }
+    return r
+}
+
+// ToUpper maps r to upper case.
+pub fn ToUpper(r: int) -> int {
+    if r < 128 {
+        if r >= 97 && r <= 122 {
+            return r - 32
+        }
+        return r
+    }
+    return caseDelta(r, 0)
+}
+
+// ToLower maps r to lower case.
+pub fn ToLower(r: int) -> int {
+    if r < 128 {
+        if r >= 65 && r <= 90 {
+            return r + 32
+        }
+        return r
+    }
+    return caseDelta(r, 1)
+}
+
+// ToTitle maps r to title case.
+pub fn ToTitle(r: int) -> int {
+    if r < 128 {
+        if r >= 97 && r <= 122 {
+            return r - 32
+        }
+        return r
+    }
+    return caseDelta(r, 2)
+}
+
+// encodeRune appends the UTF-8 encoding of r to builder b.
+fn encodeRune(b: *str.Builder, r: int) {
+    if r < 128 {
+        str.WriteByte(b, r)
+        return
+    }
+    if r < 2048 {
+        str.WriteByte(b, 192 | (r >> 6))
+        str.WriteByte(b, 128 | (r & 63))
+        return
+    }
+    if r < 65536 {
+        str.WriteByte(b, 224 | (r >> 12))
+        str.WriteByte(b, 128 | ((r >> 6) & 63))
+        str.WriteByte(b, 128 | (r & 63))
+        return
+    }
+    str.WriteByte(b, 240 | (r >> 18))
+    str.WriteByte(b, 128 | ((r >> 12) & 63))
+    str.WriteByte(b, 128 | ((r >> 6) & 63))
+    str.WriteByte(b, 128 | (r & 63))
+}
+
+// RuneStr encodes a single rune to a string.
+pub fn RuneStr(r: int) -> string {
+    b := str.NewBuilder(4)
+    encodeRune(&b, r)
+    return str.String(b)
+}
+
+// MapRunes applies f to every rune of s.
+pub fn MapRunes(s: string, f: fn(int) -> int) -> string {
+    b := str.NewBuilder(str.Len(s))
+    i := 0
+    n := str.Len(s)
+    for i < n {
+        r, size := DecodeRune(s, i)
+        if size < 1 {
+            size = 1
+        }
+        encodeRune(&b, f(r))
+        i = i + size
+    }
+    return str.String(b)
+}
+
+// ToLowerStr returns s with every rune lower-cased.
+pub fn ToLowerStr(s: string) -> string {
+    return MapRunes(s, ToLower)
+}
+
+// ToUpperStr returns s with every rune upper-cased.
+pub fn ToUpperStr(s: string) -> string {
+    return MapRunes(s, ToUpper)
+}
+
+// EqualFold reports whether a and b are equal under simple case folding.
+// Implemented as lower-casing comparison; this agrees with full case folding
+// for everything the prose pipeline feeds it (there are no fold-only
+// distinctions in any shipped word: list).
+pub fn EqualFold(a: string, b: string) -> bool {
+    return ToLowerStr(a) == ToLowerStr(b)
+}
+
+// IsSeparator mirrors the word-boundary rule used for title casing: ASCII
+// alphanumerics and underscore are not separators; other letters and digits
+// are not separators; everything else that is a space is, and other
+// punctuation is too.
+pub fn IsSeparator(r: int) -> bool {
+    if r < 128 {
+        if r >= 48 && r <= 57 {
+            return false
+        }
+        if r >= 97 && r <= 122 {
+            return false
+        }
+        if r >= 65 && r <= 90 {
+            return false
+        }
+        if r == 95 {
+            return false
+        }
+        return true
+    }
+    if IsLetter(r) || IsNumber(r) {
+        return false
+    }
+    return IsSpace(r)
+}
+
+// TitleStr title-cases every letter that begins a word (follows a
+// separator), matching the word-boundary behavior the NER shape feature
+// relies on.
+pub fn TitleStr(s: string) -> string {
+    b := str.NewBuilder(str.Len(s))
+    prev := 32 // pretend preceded by a space so a leading letter is cased
+    i := 0
+    n := str.Len(s)
+    for i < n {
+        r, size := DecodeRune(s, i)
+        if size < 1 {
+            size = 1
+        }
+        if IsSeparator(prev) && !IsSeparator(r) {
+            r = ToTitle(r)
+        }
+        encodeRune(&b, r)
+        prev = r
+        i = i + size
+    }
+    return str.String(b)
+}

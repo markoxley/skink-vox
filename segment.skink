@@ -1,0 +1,175 @@
+// File:    segment.skink
+// Purpose: Split text into sentences that know where they came from — a port
+//          of the reference implementation's segment package, which uses the
+//          Punkt algorithm (see internal/punkt) with prose's English
+//          customizations.
+//
+//          The trained model is immutable once built, so it is loaded once
+//          per process and shared. Sentences carry their byte offsets, so a
+//          caller never has to go looking for where one started.
+module segment
+
+// The bundled punkt model (models/punkt/en.json) is baked into every
+// binary that links this module.
+embed "models"
+
+import "internal/modelpath"
+import "internal/punkt"
+import "internal/strutil"
+import "internal/unicode"
+import "std/errors"
+import "std/str"
+
+// Sentence is a segmented span of text and its position in the source.
+//
+// The same invariant the token package documents holds here:
+//
+//	src[s.Start:s.End()] == s.Text
+//
+// Leading and trailing whitespace is trimmed from Text, and Start is
+// advanced to match, so the offsets stay accurate rather than merely close.
+pub struct Sentence {
+    // Text is the sentence, whitespace-trimmed.
+    Text: string
+
+    // Start is the byte offset of Text within the source.
+    Start: int
+
+    // End returns the byte offset just past this sentence in the source.
+    pub fn End(s: Sentence) -> int {
+        return s.Start + str.Len(s.Text)
+    }
+
+    // In returns the sentence's text as located in src, or "" if the offsets
+    // do not fit.
+    pub fn In(s: Sentence, src: string) -> string {
+        if s.Start < 0 || s.End() > str.Len(src) {
+            return ""
+        }
+        return str.Substr(src, s.Start, str.Len(s.Text))
+    }
+}
+
+// Segmenter splits text into sentences.
+pub struct Segmenter {
+    storage: punkt.Storage
+
+    // Segment splits text into sentences.
+    //
+    // Sentences that are entirely whitespace are dropped rather than
+    // returned as empty spans.
+    pub fn Segment(s: *Segmenter, text: string) -> []Sentence {
+        raw := punkt.TokenizeSentences(&s.storage, text)
+
+        var out []Sentence
+        for i := 0; i < len(raw); i = i + 1 {
+            r := raw[i]
+            start, end := trimRange(text, r.Start, r.End)
+            if start >= end {
+                continue
+            }
+            out = append(out, Sentence{Text: str.Substr(text, start, end - start), Start: start})
+        }
+        return out
+    }
+
+    // SegmentText returns just the sentence strings, for callers that do
+    // not care where they came from.
+    pub fn SegmentText(s: *Segmenter, text: string) -> []string {
+        sents := s.Segment(text)
+        var out []string
+        for i := 0; i < len(sents); i = i + 1 {
+            out = append(out, sents[i].Text)
+        }
+        return out
+    }
+}
+
+var defaultStorage punkt.Storage
+var storageLoaded = false
+var storageErr = ""
+
+// supervised abbreviations added to the loaded model on top of the trained
+// data.
+fn supervisedAbbrevs() -> []string {
+    return []string{"sgt", "gov", "no", "mt"}
+}
+
+// loadModel loads and prepares the English punkt model exactly once.
+fn loadModel() {
+    if storageLoaded {
+        return
+    }
+    storageLoaded = true
+    path := modelpath.FindModel("punkt/en.json")
+    if path == "" {
+        storageErr = "cannot locate punkt/en.json; set SKINK_VOX_MODELS"
+        return
+    }
+    data, ok := strutil.ReadDataFile(path)
+    if !ok {
+        storageErr = str.Concat("cannot read ", path)
+        return
+    }
+    s, err := punkt.LoadTraining(data)
+    if err.message != "" {
+        storageErr = err.message
+        return
+    }
+    abbrs := supervisedAbbrevs()
+    for i := 0; i < len(abbrs); i = i + 1 {
+        punkt.AddAbbrev(&s, abbrs[i])
+    }
+    defaultStorage = s
+}
+
+// New returns a Segmenter using the built-in English model.
+//
+// The model is loaded on the first call and shared thereafter, so calling
+// New repeatedly is cheap.
+pub fn New() -> (Segmenter, errors.Error) {
+    loadModel()
+    if storageErr != "" {
+        var s Segmenter
+        return s, errors.New(storageErr)
+    }
+    return newWithTraining(defaultStorage), errors.None()
+}
+
+// WithTraining returns a Segmenter using a caller-supplied punkt model.
+//
+// The storage is not copied; mutating it afterwards is not safe.
+pub fn WithTraining(training: punkt.Storage) -> Segmenter {
+    return newWithTraining(training)
+}
+
+fn newWithTraining(training: punkt.Storage) -> Segmenter {
+    return Segmenter{storage: training}
+}
+
+// trimRange narrows [start,end) past surrounding whitespace.
+fn trimRange(text: string, startIn: int, endIn: int) -> (int, int) {
+    start := startIn
+    end := endIn
+    if start < 0 {
+        start = 0
+    }
+    if end > str.Len(text) {
+        end = str.Len(text)
+    }
+    for start < end {
+        r, size := unicode.DecodeRune(text, start)
+        if size == 0 || !unicode.IsSpace(r) {
+            break
+        }
+        start = start + size
+    }
+    for end > start {
+        r, size := unicode.DecodeLastRune(text, end)
+        if size == 0 || !unicode.IsSpace(r) {
+            break
+        }
+        end = end - size
+    }
+    return start, end
+}

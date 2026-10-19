@@ -1,0 +1,368 @@
+// File:    internal_test.skink
+// Purpose: Unit tests for the internal support packages — the mini regex
+//          engine, unicode helpers, string utilities, math utilities, the
+//          word/emoticon data sets, and the binary model readers.
+module internal_test
+
+import "internal/emoticon"
+import "internal/flat"
+import "internal/mathutil"
+import "internal/maxent"
+import "internal/mini"
+import "internal/modelpath"
+import "internal/punkt"
+import "internal/strutil"
+import "internal/unicode"
+import "internal/wordlist"
+import "std/fs"
+import "std/libc"
+import "std/str"
+import "testing"
+
+// ---------------------------------------------------------------------------
+// mini — the backtracking regex engine
+// ---------------------------------------------------------------------------
+
+// TestMiniLiteral checks literal matching and Find spans.
+pub fn TestMiniLiteral() {
+    p, ok := mini.New("hello")
+    testing.AssertTrue(ok, "compile")
+    testing.AssertTrue(mini.Match(&p, "say hello there"), "contains")
+    testing.AssertFalse(mini.FullMatch(&p, "say hello"), "not full match")
+    testing.AssertTrue(mini.FullMatch(&p, "hello"), "full match")
+    a, b := mini.Find(&p, "say hello there")
+    testing.AssertEqualInt(4, a, "find start")
+    testing.AssertEqualInt(9, b, "find end")
+}
+
+// TestMiniClasses checks character classes and ranges.
+pub fn TestMiniClasses() {
+    p, ok := mini.New("[a-cx-z]+")
+    testing.AssertTrue(ok, "compile")
+    testing.AssertTrue(mini.FullMatch(&p, "abcxyz"), "class match")
+    testing.AssertFalse(mini.FullMatch(&p, "abcw"), "class reject")
+
+    n, _ := mini.New("[^0-9]+")
+    testing.AssertTrue(mini.FullMatch(&n, "abc"), "negated class")
+    testing.AssertFalse(mini.FullMatch(&n, "ab1"), "negated reject")
+}
+
+// TestMiniQuantifiers checks *, +, ?, and {m,n} repeats.
+pub fn TestMiniQuantifiers() {
+    p, _ := mini.New("ab*c")
+    testing.AssertTrue(mini.FullMatch(&p, "ac"), "star zero")
+    testing.AssertTrue(mini.FullMatch(&p, "abbbbc"), "star many")
+    p2, _ := mini.New("ab+c")
+    testing.AssertFalse(mini.FullMatch(&p2, "ac"), "plus needs one")
+    p3, _ := mini.New("ab?c")
+    testing.AssertTrue(mini.FullMatch(&p3, "ac"), "question zero")
+    p4, _ := mini.New("a{2,}b")
+    testing.AssertTrue(mini.FullMatch(&p4, "aaab"), "open repeat")
+    testing.AssertFalse(mini.FullMatch(&p4, "ab"), "open repeat min")
+    p5, _ := mini.New("a{1,2}b")
+    testing.AssertTrue(mini.FullMatch(&p5, "ab"), "bounded low")
+    testing.AssertTrue(mini.FullMatch(&p5, "aab"), "bounded high")
+    testing.AssertFalse(mini.FullMatch(&p5, "aaab"), "bounded over")
+    // A literal brace quantifier (written expanded to dodge interpolation).
+    p6, _ := mini.New("[aeiou][aeiou][aeiou]")
+    testing.AssertTrue(mini.FullMatch(&p6, "eau"), "explicit repeat")
+}
+
+// TestMiniAlternation checks groups and alternation.
+pub fn TestMiniAlternation() {
+    p, ok := mini.New("(foo|bar)+")
+    testing.AssertTrue(ok, "compile")
+    testing.AssertTrue(mini.FullMatch(&p, "foobarfoo"), "alternation")
+    testing.AssertFalse(mini.FullMatch(&p, "foox"), "alternation reject")
+    p2, _ := mini.New("colou?r")
+    testing.AssertTrue(mini.FullMatch(&p2, "color"), "optional letter")
+    testing.AssertTrue(mini.FullMatch(&p2, "colour"), "optional letter 2")
+}
+
+// TestMiniAnchors checks ^ $ and dot.
+pub fn TestMiniAnchors() {
+    p, _ := mini.New("^abc$")
+    testing.AssertTrue(mini.FullMatch(&p, "abc"), "anchored")
+    testing.AssertFalse(mini.Match(&p, "xabc"), "anchor start")
+    d, _ := mini.New("a.c")
+    testing.AssertTrue(mini.FullMatch(&d, "axc"), "dot")
+}
+
+// TestMiniEscapes checks escaped specials and class escapes.
+pub fn TestMiniEscapes() {
+    p, ok := mini.New("a\\.b")
+    testing.AssertTrue(ok, "compile")
+    testing.AssertTrue(mini.FullMatch(&p, "a.b"), "escaped dot")
+    testing.AssertFalse(mini.FullMatch(&p, "axb"), "escaped dot literal")
+    w, _ := mini.New("\\w+")
+    testing.AssertTrue(mini.FullMatch(&w, "abc_123"), "word class")
+    d, _ := mini.New("\\d+")
+    testing.AssertTrue(mini.FullMatch(&d, "12345"), "digit class")
+    s, _ := mini.New("\\s")
+    testing.AssertTrue(mini.FullMatch(&s, " "), "space class")
+}
+
+// TestMiniFindAll checks global matching.
+pub fn TestMiniFindAll() {
+    p, _ := mini.New("[aeiouy]+")
+    spans := mini.FindAll(&p, "summary")
+    testing.AssertTrue(len(spans) >= 2, "vowel runs found")
+    testing.AssertTrue(spans[0].Start < spans[0].End, "span ordered")
+}
+
+// TestMiniBadPattern checks the unsupported-feature rejection.
+pub fn TestMiniBadPattern() {
+    _, ok := mini.New("(?=x)y")
+    testing.AssertFalse(ok, "lookahead rejected")
+}
+
+// ---------------------------------------------------------------------------
+// unicode
+// ---------------------------------------------------------------------------
+
+// TestDecodeRune checks UTF-8 decoding forward and backward.
+pub fn TestDecodeRune() {
+    s := "héllo" // é is two bytes
+    r, size := unicode.DecodeRune(s, 1)
+    testing.AssertEqualInt(233, r, "decode é")
+    testing.AssertEqualInt(2, size, "é is 2 bytes")
+    r2, size2 := unicode.DecodeRune(s, 0)
+    testing.AssertEqualInt(104, r2, "decode h")
+    testing.AssertEqualInt(1, size2, "ascii is 1 byte")
+    // Last-rune decode.
+    e := "€" // U+20AC, 3 bytes
+    r3, _ := unicode.DecodeLastRune(e, str.Len(e))
+    testing.AssertEqualInt(8364, r3, "decode last")
+}
+
+// TestRuneCount checks rune vs byte length.
+pub fn TestRuneCount() {
+    testing.AssertEqualInt(5, unicode.RuneCount("héllo"), "runes")
+    testing.AssertEqualInt(6, str.Len("héllo"), "bytes")
+}
+
+// TestUnicodeClasses checks the category predicates.
+pub fn TestUnicodeClasses() {
+    testing.AssertTrue(unicode.IsLetter(104), "h is letter")
+    testing.AssertTrue(unicode.IsLetter(233), "é is letter")
+    testing.AssertTrue(unicode.IsNumber(57), "9 is number")
+    testing.AssertTrue(unicode.IsSpace(32), "space")
+    testing.AssertTrue(unicode.IsSpace(9), "tab")
+    testing.AssertFalse(unicode.IsSpace(104), "h not space")
+    testing.AssertTrue(unicode.IsUpper(65), "A upper")
+    testing.AssertTrue(unicode.IsLower(97), "a lower")
+    testing.AssertFalse(unicode.IsLetter(52), "4 not letter")
+}
+
+// TestCaseMapping checks ToUpper/ToLower/ToTitle and string forms.
+pub fn TestCaseMapping() {
+    testing.AssertEqualInt(65, unicode.ToUpper(97), "a->A")
+    testing.AssertEqualInt(97, unicode.ToLower(65), "A->a")
+    testing.AssertEqualInt(233, unicode.ToLower(201), "É->é")
+    testing.AssertEqualInt(201, unicode.ToUpper(233), "é->É")
+    testing.AssertEqualString("HELLO", unicode.ToUpperStr("hello"), "ToUpperStr")
+    testing.AssertEqualString("hello", unicode.ToLowerStr("HELLO"), "ToLowerStr")
+    // Special case: 'ß' has no single-rune uppercase; string form grows.
+    testing.AssertEqualInt(223, unicode.ToUpper(223), "ß unchanged as rune")
+}
+
+// TestMapRunes checks rune-wise mapping.
+pub fn TestMapRunes() {
+    got := unicode.MapRunes("abc", unicode.ToUpper)
+    testing.AssertEqualString("ABC", got, "map upper")
+}
+
+// TestRuneStr checks rune->string encoding.
+pub fn TestRuneStr() {
+    testing.AssertEqualString("A", unicode.RuneStr(65), "ascii")
+    testing.AssertEqualString("é", unicode.RuneStr(233), "2-byte")
+}
+
+// TestEqualFold checks case-insensitive comparison.
+pub fn TestEqualFold() {
+    testing.AssertTrue(unicode.EqualFold("Hello", "hELLO"), "fold equal")
+    testing.AssertFalse(unicode.EqualFold("Hello", "world"), "fold unequal")
+}
+
+// TestIsSeparator checks the strings.Title-compatible separator logic.
+pub fn TestIsSeparator() {
+    testing.AssertTrue(unicode.IsSeparator(32), "space separates")
+    testing.AssertFalse(unicode.IsSeparator(65), "A does not")
+    // TitleStr capitalizes after separators like Go's strings.Title.
+    testing.AssertEqualString("Hello World", unicode.TitleStr("hello world"), "title")
+}
+
+// ---------------------------------------------------------------------------
+// strutil / mathutil / wordlist / emoticon / modelpath
+// ---------------------------------------------------------------------------
+
+// TestStrutil checks the string helpers.
+pub fn TestStrutil() {
+    testing.AssertTrue(strutil.HasAnySuffix("can't", []string{"'ll", "n't"}), "suffix")
+    testing.AssertFalse(strutil.HasAnySuffix("cat", []string{"'ll"}), "suffix miss")
+    testing.AssertTrue(strutil.HasAnyPrefix("#tag", []string{"#", "@"}), "prefix")
+    testing.AssertEqualInt(3, strutil.HasAnyIndex("auntie", []string{"xx", "tie"}), "index")
+    testing.AssertTrue(strutil.StringInSlice("b", []string{"a", "b"}), "in slice")
+    testing.AssertEqualInt(98, strutil.CharAt("abc", 1), "char at")
+    testing.AssertEqualInt(2, strutil.Min(2, 5), "min")
+    fields := strutil.Fields("  one  two\tthree ")
+    testing.AssertTrue(len(fields) == 3, "fields count")
+    testing.AssertEqualString("two", fields[1], "fields value")
+}
+
+// TestMathutil checks the float helpers.
+pub fn TestMathutil() {
+    testing.AssertTrue(mathutil.IsNaN(mathutil.NaN()), "NaN")
+    testing.AssertFalse(mathutil.IsNaN(1.5), "not NaN")
+    testing.AssertEqualFloat(2.0, mathutil.Mean([]float{1.0, 2.0, 3.0}), "mean")
+    sd := mathutil.StdDev([]float{1.0, 2.0, 3.0})
+    testing.AssertTrue(sd > 0.81 && sd < 0.82, "population stddev ~0.816")
+    testing.AssertEqualFloat(1.24, mathutil.Round(1.235, 2), "round")
+}
+
+// TestWordlist checks the common-word set.
+pub fn TestWordlist() {
+    testing.AssertTrue(wordlist.IsBasic("the"), "the is basic")
+    testing.AssertFalse(wordlist.IsBasic("perspicacious"), "rare word")
+    testing.AssertTrue(wordlist.Len() > 100, "list populated")
+}
+
+// TestEmoticon checks the emoticon set.
+pub fn TestEmoticon() {
+    testing.AssertTrue(emoticon.Is(":-)"), "smiley")
+    testing.AssertFalse(emoticon.Is("hello"), "not emoticon")
+}
+
+// TestModelPath checks the bundled models resolve.
+pub fn TestModelPath() {
+    testing.AssertTrue(modelpath.FindModel("punkt/en.json") != "", "punkt model found")
+    testing.AssertTrue(modelpath.FindModel("tag/en.bin") != "", "tag model found")
+    testing.AssertTrue(modelpath.FindModel("ner/en.bin") != "", "ner model found")
+    testing.AssertTrue(modelpath.FindModel("nope.bin") == "", "missing returns empty")
+}
+
+// ---------------------------------------------------------------------------
+// punkt internals
+// ---------------------------------------------------------------------------
+
+// TestPunktToken checks token classification predicates.
+pub fn TestPunktToken() {
+    t := punkt.NewPunktToken("Hello.")
+    testing.AssertTrue(punkt.HasPeriodFinal(t), "period final")
+    testing.AssertTrue(punkt.FirstUpper(t), "first upper")
+    t2 := punkt.NewPunktToken("hello")
+    testing.AssertFalse(punkt.HasPeriodFinal(t2), "no period")
+    testing.AssertTrue(punkt.FirstLower(t2), "first lower")
+    t3 := punkt.NewPunktToken("##number##42")
+    testing.AssertTrue(punkt.IsNumber(t3), "number")
+    testing.AssertFalse(punkt.IsNumber(punkt.NewPunktToken("42")), "raw digits are not normalized numbers")
+    t4 := punkt.NewPunktToken("...")
+    testing.AssertTrue(punkt.IsEllipsis(t4), "ellipsis")
+    t5 := punkt.NewPunktToken("J.")
+    testing.AssertTrue(punkt.IsInitial(t5), "initial")
+    testing.AssertTrue(punkt.IsAlpha(punkt.NewPunktToken("word")), "alpha")
+    testing.AssertFalse(punkt.IsNonPunct(punkt.NewPunktToken(",")), "comma punct")
+    testing.AssertTrue(punkt.HasSentEndChars(punkt.NewPunktToken("Stop!")), "sent end")
+    testing.AssertTrue(str.Len(punkt.Punctuation()) > 0, "punct set")
+    testing.AssertTrue(punkt.HasSentencePunct("wait... what"), "sent punct scan")
+}
+
+// TestPunktStorage checks model loading and abbreviation lookup.
+pub fn TestPunktStorage() {
+    data, err := fs.ReadAll("models/punkt/en.json")
+    testing.AssertEqualString("", err.message, "read model")
+    st, terr := punkt.LoadTraining(data)
+    testing.AssertEqualString("", terr.message, "load")
+    testing.AssertTrue(punkt.IsAbbr(&st, "mr", ""), "mr abbrev")
+    punkt.AddAbbrev(&st, "xyz")
+    testing.AssertTrue(punkt.IsAbbr(&st, "xyz", ""), "added abbrev")
+
+    // Corrupt JSON must return an error, not a crash.
+    _, bad := punkt.LoadTraining("{not json")
+    testing.AssertTrue(bad.message != "", "bad json rejected")
+}
+
+// TestPunktAnnotate checks the annotation pipeline directly.
+pub fn TestPunktAnnotate() {
+    data, _ := fs.ReadAll("models/punkt/en.json")
+    st, _ := punkt.LoadTraining(data)
+    toks := punkt.AnnotatedTokens(&st, "Hello. Bye.")
+    testing.AssertTrue(len(toks) > 0, "annotated tokens")
+    sents := punkt.TokenizeSentences(&st, "Hello. Bye.")
+    testing.AssertTrue(len(sents) == 2, "two sentences")
+}
+
+// ---------------------------------------------------------------------------
+// flat / maxent model readers
+// ---------------------------------------------------------------------------
+
+// TestFlatModel checks the tagger model reader end to end.
+pub fn TestFlatModel() {
+    path := "models/tag/en.bin"
+    size := int(fs.FileSize(path))
+    f, ferr := fs.Open(path, "rb")
+    testing.AssertEqualString("", ferr.message, "open model")
+    data := libc.malloc(size)
+    nr := f.Read(data, size)
+    f.Close()
+    testing.AssertTrue(nr == size, "read all")
+    m, merr := flat.Unmarshal(data, size)
+    testing.AssertEqualString("", merr.message, "unmarshal")
+    testing.AssertTrue(flat.NumFeatures(&m) > 0, "features")
+    testing.AssertTrue(flat.NumPairs(&m) > 0, "pairs")
+    classes := flat.Classes(&m)
+    testing.AssertTrue(len(classes) > 0, "classes")
+    testing.AssertTrue(len(classes) <= 64, "class bound")
+
+    // TagFor hits the tag dictionary for common words.
+    t, ok := flat.TagFor(&m, "the")
+    testing.AssertTrue(ok, "tag dict hit")
+    testing.AssertTrue(str.Len(t) > 0, "tag nonempty")
+    _, miss := flat.TagFor(&m, "zzqqxx")
+    testing.AssertFalse(miss, "tag dict miss")
+
+    // Score accumulation + Best picks a class.
+    var scores []float
+    for i := 0; i < len(classes); i = i + 1 {
+        scores = append(scores, 0.0)
+    }
+    flat.AccumulateInto(&m, "bias", 1.0, scores)
+    best := flat.Best(&m, scores)
+    testing.AssertTrue(str.Len(best) > 0, "best class")
+
+    // Error paths.
+    _, e1 := flat.Unmarshal("xx", 2)
+    testing.AssertTrue(e1.message != "", "truncated rejected")
+    _, e2 := flat.Unmarshal("BADMAGIC00x", 11)
+    testing.AssertTrue(e2.message != "", "bad magic rejected")
+    _, e3 := flat.Unmarshal(str.Concat("PROSETAG", "\x02\x00\x00\x00"), 12)
+    testing.AssertTrue(e3.message != "", "bad version rejected")
+    _, e4 := flat.Load("/tmp/definitely-not-here.bin")
+    testing.AssertTrue(e4.message != "", "missing file rejected")
+}
+
+// TestMaxentModel checks the NER model reader end to end.
+pub fn TestMaxentModel() {
+    path2 := "models/ner/en.bin"
+    size2 := int(fs.FileSize(path2))
+    f2, ferr2 := fs.Open(path2, "rb")
+    testing.AssertEqualString("", ferr2.message, "open model")
+    data2 := libc.malloc(size2)
+    nr2 := f2.Read(data2, size2)
+    f2.Close()
+    testing.AssertTrue(nr2 == size2, "read all")
+    m, merr := maxent.Unmarshal(data2, size2)
+    testing.AssertEqualString("", merr.message, "unmarshal")
+    testing.AssertTrue(maxent.NumKeys(&m) > 0, "keys")
+    labels := maxent.Labels(&m)
+    testing.AssertTrue(len(labels) > 0, "labels")
+    testing.AssertTrue(maxent.Cardinality(&m) > 0, "cardinality")
+
+    // Error paths.
+    _, e1 := maxent.Unmarshal("xx", 2)
+    testing.AssertTrue(e1.message != "", "truncated rejected")
+    _, e2 := maxent.Unmarshal("BADMAGIC00x", 11)
+    testing.AssertTrue(e2.message != "", "bad magic rejected")
+    _, e3 := maxent.Load("/tmp/definitely-not-here.bin")
+    testing.AssertTrue(e3.message != "", "missing file rejected")
+}

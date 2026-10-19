@@ -1,0 +1,282 @@
+// File:    tokenize_test.skink
+// Purpose: Unit tests for tokenize — the default Tokenizer, its Using*
+//          options, the regexp-family tokenizers (word boundary, word
+//          punct, blankline, custom regexp), and the Penn Treebank port.
+//          Golden strings are verified against the reference corpus.
+module tokenize_test
+
+import "tokenize"
+import "std/json"
+import "std/fs"
+import "std/str"
+import "testing"
+
+fn texts(toks: []tokenize.Token) -> []string {
+    var out []string
+    for i := 0; i < len(toks); i = i + 1 {
+        out = append(out, toks[i].Text)
+    }
+    return out
+}
+
+fn joinToks(toks: []string) -> string {
+    return str.Join(toks, "|")
+}
+
+fn assertTokens(want: []string, got: []tokenize.Token, msg: string) {
+    testing.AssertTrue(len(want) == len(got), str.Concat(msg, " count"))
+    if len(want) != len(got) {
+        return
+    }
+    for i := 0; i < len(want); i = i + 1 {
+        testing.AssertEqualString(want[i], got[i].Text, str.Concat(msg, " tok"))
+    }
+}
+
+// TestCorpus drives every input in testdata/tokenize.json through the
+// default tokenizer and checks the position invariant on each token.
+pub fn TestCorpus() {
+    data, err := fs.ReadAll("testdata/tokenize.json")
+    testing.AssertEqualString("", err.message, "read corpus")
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, "parse corpus")
+    tk := tokenize.NewTokenizer()
+    n := json.ArrayLen(v)
+    testing.AssertTrue(n > 0, "corpus nonempty")
+    for i := 0; i < n; i = i + 1 {
+        src := json.AsString(json.ArrayGet(v, i))
+        toks := tk.Tokenize(src)
+        testing.AssertTrue(len(toks) > 0, "tokenized")
+        last := -1
+        for j := 0; j < len(toks); j = j + 1 {
+            t := toks[j]
+            // The position invariant: offsets locate Text in src.
+            testing.AssertEqualString(t.Text, t.In(src), "offset invariant")
+            testing.AssertTrue(t.Start >= 0, "start >= 0")
+            testing.AssertTrue(t.End() <= str.Len(src), "end <= len")
+            testing.AssertTrue(t.Start > last || t.Start == 0, "offsets ordered")
+            last = t.Start
+        }
+    }
+}
+
+// TestContraction checks contraction splitting rules.
+pub fn TestContraction() {
+    tk := tokenize.NewTokenizer()
+    assertTokens([]string{"They", "'ll", "save", "and", "invest", "more", "."},
+        tk.Tokenize("They'll save and invest more."), "contraction")
+    assertTokens([]string{"hi", ",", "my", "name", "ca", "n't", "hello", ","},
+        tk.Tokenize("hi, my name can't hello,"), "n't split")
+}
+
+// TestAbbreviations checks internal periods stay attached.
+pub fn TestAbbreviations() {
+    tk := tokenize.NewTokenizer()
+    assertTokens([]string{"I", "visited", "the", "U.S.A.", "last", "year", "."},
+        tk.Tokenize("I visited the U.S.A. last year."), "U.S.A.")
+    assertTokens([]string{"I", "can", "see", "Mt.", "Fuji", "from", "here", "."},
+        tk.Tokenize("I can see Mt. Fuji from here."), "Mt.")
+}
+
+// TestEmailURL checks addresses and URLs stay whole.
+pub fn TestEmailURL() {
+    tk := tokenize.NewTokenizer()
+    toks := tk.Tokenize("Her email is Jane.Doe@example.com. I sent her an email.")
+    found := false
+    for i := 0; i < len(toks); i = i + 1 {
+        if toks[i].Text == "Jane.Doe@example.com" {
+            found = true
+        }
+    }
+    testing.AssertTrue(found, "email kept whole")
+    toks2 := tk.Tokenize("The site is: https://www.example.50.com/new-site/awesome_content.html. Please check it out.")
+    found2 := false
+    for i := 0; i < len(toks2); i = i + 1 {
+        if toks2[i].Text == "https://www.example.50.com/new-site/awesome_content.html" {
+            found2 = true
+        }
+    }
+    testing.AssertTrue(found2, "url kept whole")
+}
+
+// TestNumeric checks numbers with internal punctuation.
+pub fn TestNumeric() {
+    tk := tokenize.NewTokenizer()
+    toks := tk.Tokenize("She has $100.00 in her bag.")
+    found := false
+    for i := 0; i < len(toks); i = i + 1 {
+        if toks[i].Text == "100.00" {
+            found = true
+        }
+    }
+    testing.AssertTrue(found, "decimal kept whole")
+}
+
+// TestUsingSplitCases checks that emptying splitCases keeps contractions.
+pub fn TestUsingSplitCases() {
+    tk := tokenize.NewTokenizerOpts([]tokenize.Option{
+        tokenize.UsingSplitCases([]string{}),
+    })
+    toks := tk.Tokenize("They'll save us.")
+    testing.AssertEqualString("They'll", toks[0].Text, "contraction whole")
+}
+
+// TestUsingAffixes checks custom prefix/suffix split sets.
+pub fn TestUsingAffixes() {
+    tk := tokenize.NewTokenizerOpts([]tokenize.Option{
+        tokenize.UsingPrefixes([]string{"#"}),
+        tokenize.UsingSuffixes([]string{"!"}),
+    })
+    toks := tk.Tokenize("#hello world!")
+    testing.AssertEqualString("#", toks[0].Text, "prefix")
+    testing.AssertEqualString("hello", toks[1].Text, "word")
+    testing.AssertEqualString("!", toks[len(toks) - 1].Text, "suffix")
+}
+
+// TestUsingSpecialTest checks the keep-whole predicate.
+pub fn TestUsingSpecialTest() {
+    tk := tokenize.NewTokenizerOpts([]tokenize.Option{
+        tokenize.UsingSpecialTest(fn(s: string) -> bool {
+            for i := 0; i < len(s); i = i + 1 {
+                if s[i] == 45 {
+                    return true
+                }
+            }
+            return false
+        }),
+    })
+    toks := tk.Tokenize("well-known fact")
+    testing.AssertEqualString("well-known", toks[0].Text, "special kept whole")
+    testing.AssertEqualString("fact", toks[1].Text, "other token")
+}
+
+// TestEmpty checks empty and whitespace-only input.
+pub fn TestEmpty() {
+    tk := tokenize.NewTokenizer()
+    testing.AssertTrue(len(tk.Tokenize("")) == 0, "empty input")
+    testing.AssertTrue(len(tk.Tokenize("   \t\n  ")) == 0, "whitespace only")
+}
+
+// TestUnicode checks non-ASCII input tokenizes and offsets stay correct.
+pub fn TestUnicode() {
+    tk := tokenize.NewTokenizer()
+    src := "Héllo wörld"
+    toks := tk.Tokenize(src)
+    testing.AssertTrue(len(toks) == 2, "two words")
+    testing.AssertEqualString("Héllo", toks[0].Text, "accented word")
+    testing.AssertEqualString(toks[0].Text, toks[0].In(src), "offset invariant")
+    testing.AssertEqualString(toks[1].Text, toks[1].In(src), "offset invariant 2")
+}
+
+// TestEmoticons checks emoticons stay whole.
+pub fn TestEmoticons() {
+    tk := tokenize.NewTokenizer()
+    toks := tk.Tokenize("hi there :-) bye")
+    found := false
+    for i := 0; i < len(toks); i = i + 1 {
+        if toks[i].Text == ":-)" {
+            found = true
+        }
+    }
+    testing.AssertTrue(found, "emoticon kept whole")
+}
+
+// TestWordBoundary checks the whitespace/word-boundary tokenizer.
+pub fn TestWordBoundary() {
+    wb := tokenize.NewWordBoundaryTokenizer()
+    words := wb.Tokenize("Hello, world — this is 2.5.")
+    testing.AssertTrue(len(words) > 0, "words produced")
+    testing.AssertEqualString("Hello", words[0], "word boundary drops punct")
+    testing.AssertTrue(str.IndexOf(words[0], " ") < 0, "no whitespace in word")
+}
+
+// TestWordPunct checks the word-punctuation tokenizer splits punctuation.
+pub fn TestWordPunct() {
+    wp := tokenize.NewWordPunctTokenizer()
+    words := wp.Tokenize("Hello, world!")
+    joined := joinToks(words)
+    testing.AssertTrue(str.IndexOf(joined, "Hello") >= 0, "has Hello")
+    testing.AssertTrue(str.IndexOf(joined, "world") >= 0, "has world")
+    testing.AssertTrue(str.IndexOf(joined, ",") >= 0, "comma split out")
+    testing.AssertTrue(str.IndexOf(joined, "!") >= 0, "bang split out")
+}
+
+// TestBlankline checks the blankline tokenizer splits on paragraph breaks.
+pub fn TestBlankline() {
+    bl := tokenize.NewBlanklineTokenizer()
+    parts := bl.Tokenize("para one.\n\npara two.\n\n\npara three.")
+    testing.AssertTrue(len(parts) == 3, "three paragraphs")
+    testing.AssertEqualString("para one.", parts[0], "first paragraph")
+    testing.AssertEqualString("para three.", parts[2], "third paragraph")
+}
+
+// TestRegexp checks the custom regexp tokenizer in both modes.
+pub fn TestRegexp() {
+    // gaps=false: tokens are the matches.
+    r := tokenize.NewRegexpTokenizer("[0-9]+", false, true)
+    words := r.Tokenize("a1b22c333")
+    testing.AssertTrue(len(words) == 3, "match mode count")
+    testing.AssertEqualString("22", words[1], "match mode")
+    // gaps=true: tokens are the spans between matches.
+    g := tokenize.NewRegexpTokenizer("\\s+", true, true)
+    words2 := g.Tokenize("one two  three")
+    testing.AssertTrue(len(words2) == 3, "gap mode count")
+    testing.AssertEqualString("three", words2[2], "gap mode")
+}
+
+// TestTreebank drives testdata/treebank_golden.json — inputs mapped to the
+// exact token streams the reference implementation produces.
+pub fn TestTreebank() {
+    data, err := fs.ReadAll("testdata/treebank_golden.json")
+    testing.AssertEqualString("", err.message, "read golden")
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, "parse golden")
+    tb := tokenize.NewTreebankWordTokenizer()
+    n := json.ObjectLen(v)
+    testing.AssertTrue(n > 0, "golden nonempty")
+    for i := 0; i < n; i = i + 1 {
+        src, arr := json.ObjectGetByIndex(v, i)
+        got := tb.Tokenize(src)
+        wn := json.ArrayLen(arr)
+        if len(got) != wn {
+            testing.Errorf(str.Concat("treebank count mismatch on: ", src))
+            continue
+        }
+        for j := 0; j < wn; j = j + 1 {
+            want := json.AsString(json.ArrayGet(arr, j))
+            if got[j] != want {
+                testing.Errorf(str.Concat(str.Concat("treebank tok mismatch on: ", src), str.Concat(" got ", got[j])))
+            }
+        }
+    }
+}
+
+// TestTokenOffsetsCorpus checks offsets_golden.json — every token's
+// (start, end, text) triple as produced by the reference.
+pub fn TestTokenOffsetsCorpus() {
+    data, err := fs.ReadAll("testdata/offsets_golden.json")
+    testing.AssertEqualString("", err.message, "read golden")
+    v, jerr := json.Unmarshal(data)
+    testing.AssertEqualString("", jerr.message, "parse golden")
+    tk := tokenize.NewTokenizer()
+    n := json.ObjectLen(v)
+    for i := 0; i < n; i = i + 1 {
+        src, arr := json.ObjectGetByIndex(v, i)
+        got := tk.Tokenize(src)
+        wn := json.ArrayLen(arr)
+        if len(got) != wn {
+            testing.Errorf(str.Concat("offset count mismatch on: ", src))
+            continue
+        }
+        for j := 0; j < wn; j = j + 1 {
+            triple := json.ArrayGet(arr, j)
+            wStart := int(json.AsNumber(json.ArrayGet(triple, 0)))
+            wEnd := int(json.AsNumber(json.ArrayGet(triple, 1)))
+            wText := json.AsString(json.ArrayGet(triple, 2))
+            t := got[j]
+            if t.Start != wStart || t.End() != wEnd || t.Text != wText {
+                testing.Errorf(str.Concat("offset mismatch on: ", src))
+            }
+        }
+    }
+}

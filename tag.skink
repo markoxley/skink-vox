@@ -1,0 +1,673 @@
+// File:    tag.skink
+// Purpose: Part-of-speech tagging — a port of the reference implementation's
+//          tag package: a greedy averaged-perceptron tagger over a flat
+//          embedded model, a lexicon-backed wrapper, and a name registry.
+//
+//          Tag adds a single field to token.Token — Tag, the Penn
+//          Treebank-ish POS label the model assigns. Everything else about a
+//          tagged token is inherited from whatever produced it, so a
+//          tokenizer's positions survive tagging intact.
+//
+//          The model ships as a binary file (models/tag/en.bin) baked into
+//          the binary by the embed directive below and resolved at load
+//          time by internal/modelpath.
+module tag
+
+embed "models"
+
+import "internal/flat"
+import "internal/modelpath"
+import "internal/emoticon"
+import "internal/unicode"
+import "token"
+
+// Token is token.Token, re-exported so callers using only this
+// module do not have to import token themselves.
+pub type Token = token.Token
+import "std/errors"
+import "std/fs"
+import "std/libc"
+import "std/sort"
+import "std/str"
+
+// Interface is a part-of-speech tagger.
+pub template Interface {
+    // Tag tags every word in order, returning one token per word. Since
+    // nothing is being sliced out of a source string, Start stays zero and
+    // Text carries the word.
+    fn Tag(self: Interface, words: []string) -> []token.Token
+
+    // TagTokens fills in Tag on every token in place.
+    fn TagTokens(self: Interface, tokens: []token.Token)
+
+    // Name returns a short identifier describing the tagger.
+    fn Name(self: Interface) -> string
+}
+
+// ============================================================================
+// Perceptron — the default tagger
+// ============================================================================
+
+// Tagger is the perceptron tagger. It satisfies Interface.
+pub struct Tagger {
+    model:    flat.Model
+    lexicon:  map[string]string
+    hasLexicon: bool
+
+    // Tag tags a slice of words.
+    //
+    // The input is treated as one sentence; the tagger conditions on the
+    // previous two tags, so sentence boundaries matter.
+    pub fn Tag(t: *Tagger, words: []string) -> []token.Token {
+        var tokens []token.Token
+        for i := 0; i < len(words); i = i + 1 {
+            tokens = append(tokens, token.Token{Text: words[i]})
+        }
+        t.TagTokens(tokens)
+        return tokens
+    }
+
+    // TagTokens fills in the Tag field of each token, using its Text.
+    pub fn TagTokens(t: *Tagger, tokens: []token.Token) {
+        if len(tokens) == 0 {
+            return
+        }
+
+        // context is the normalized words padded with two sentinels at each
+        // end, so predict can index i-2 .. i+2 without bounds checks.
+        need := len(tokens) + 4
+        var ctx []string
+        for i := 0; i < need; i = i + 1 {
+            ctx = append(ctx, "")
+        }
+        ctx[0] = "-START-"
+        ctx[1] = "-START2-"
+        for i := 0; i < len(tokens); i = i + 1 {
+            ctx[i + 2] = normalize(tokens[i].Text)
+        }
+        ctx[need - 2] = "-END-"
+        ctx[need - 1] = "-END2-"
+
+        p1 := "-START-"
+        p2 := "-START2-"
+        for i := 0; i < len(tokens); i = i + 1 {
+            tag := t.tagOne(i, ctx, tokens[i].Text, p1, p2)
+            tokens[i].Tag = tag
+            p2 = p1
+            p1 = tag
+        }
+    }
+
+    // Name returns the tagger's identifier.
+    pub fn Name(t: *Tagger) -> string {
+        return Default
+    }
+
+    // tagOne resolves a single token. The special cases short-circuit the
+    // model for tokens it was never trained on.
+    fn tagOne(t: *Tagger, i: int, ctx: []string, word: string, p1: string, p2: string) -> string {
+        if word == "-" {
+            return "-"
+        }
+        if emoticon.Is(word) {
+            return "SYM"
+        }
+        if str.StartsWith(word, "@") {
+            return "NN"
+        }
+        if matchNoneRe(word) {
+            return "-NONE-"
+        }
+        if matchKeepRe(word) {
+            return word
+        }
+        // Ahead of the model's own lexicon: a caller supplying one is
+        // making a more specific claim than the training data.
+        lt, ok := t.lookup(word)
+        if ok {
+            return lt
+        }
+        mt, mok := flat.TagFor(&t.model, word)
+        if mok {
+            return mt
+        }
+        return t.predict(i, ctx, word, p1, p2)
+    }
+
+    // lookup consults the caller's lexicon, trying the word as written
+    // before its lower-case form so that one entry covers every casing.
+    fn lookup(t: *Tagger, word: string) -> (string, bool) {
+        if !t.hasLexicon {
+            return "", false
+        }
+        v, ok := t.lexicon[word]
+        if ok {
+            return v, true
+        }
+        lower := unicode.ToLowerStr(word)
+        if lower == word {
+            return "", false
+        }
+        v2, ok2 := t.lexicon[lower]
+        return v2, ok2
+    }
+
+    // predict scores the model's features for one token and returns the
+    // best tag.
+    fn predict(t: *Tagger, i: int, ctx: []string, word: string, p1: string, p2: string) -> string {
+        n := len(flat.Classes(&t.model))
+        var scores []float
+        for j := 0; j < n; j = j + 1 {
+            scores = append(scores, 0.0)
+        }
+
+        ii := i + 2
+        if len(ctx) - 3 < ii {
+            ii = len(ctx) - 3
+        }
+
+        suf := suffixN(word, 3)
+        pre := prefix1(word)
+        iMinus := suffixN(ctx[ii - 1], 3)
+        iPlus := suffixN(ctx[ii + 1], 3)
+
+        // Each feature is scored with weight 1. A feature that appears
+        // twice contributes twice, which is correct because scoring is
+        // linear.
+        t.accumulate("bias", scores)
+        t.accumulate(str.Concat("i suffix ", suf), scores)
+        t.accumulate(str.Concat("i pref1 ", pre), scores)
+        t.accumulate(str.Concat("i-1 tag ", p1), scores)
+        t.accumulate(str.Concat("i-2 tag ", p2), scores)
+        t.accumulate(str.Concat("i tag+i-2 tag ", str.Concat(p1, str.Concat(" ", p2))), scores)
+        t.accumulate(str.Concat("i word ", ctx[ii]), scores)
+        t.accumulate(str.Concat("i-1 tag+i word ", str.Concat(p1, str.Concat(" ", ctx[ii]))), scores)
+        t.accumulate(str.Concat("i-1 word ", ctx[ii - 1]), scores)
+        t.accumulate(str.Concat("i-1 suffix ", iMinus), scores)
+        t.accumulate(str.Concat("i-2 word ", ctx[ii - 2]), scores)
+        t.accumulate(str.Concat("i+1 word ", ctx[ii + 1]), scores)
+        t.accumulate(str.Concat("i+1 suffix ", iPlus), scores)
+        t.accumulate(str.Concat("i+2 word ", ctx[ii + 2]), scores)
+
+        return flat.Best(&t.model, scores)
+    }
+
+    // accumulate adds the weights of one feature key into scores.
+    fn accumulate(t: *Tagger, key: string, scores: []float) {
+        flat.AccumulateInto(&t.model, key, 1.0, scores)
+    }
+}
+
+// Default names the tagger used when a caller does not choose.
+pub var Default = "perceptron"
+
+// Lexicon maps words to the tag they should always take.
+pub type Lexicon = map[string]string
+
+// Option configures a Tagger — the counterpart of the reference's
+// tag.Option. Skink has no variadic calls, so a set of options is passed as
+// a slice to the *Opts constructors.
+pub type Option = fn(*Tagger)
+
+// Factory constructs a tagger for the registry — tag.Factory in the
+// reference.
+pub type Factory = fn() -> (Interface, errors.Error)
+pub fn WithLexicon(l: Lexicon) -> fn(*Tagger) {
+    return fn(t: *Tagger) {
+        t.lexicon = l
+        t.hasLexicon = true
+    }
+}
+
+// suffixN returns the last n bytes of w, or all of w if shorter.
+fn suffixN(w: string, n: int) -> string {
+    if str.Len(w) <= n {
+        return w
+    }
+    return str.Substr(w, str.Len(w) - n, n)
+}
+
+// prefix1 returns the first byte of w as a string.
+//
+// Byte-oriented deliberately: the model was trained with these keys, so
+// switching to runes would silently stop matching learned features.
+fn prefix1(w: string) -> string {
+    if str.Len(w) == 0 {
+        return ""
+    }
+    return str.Substr(w, 0, 1)
+}
+
+// normalize maps a word onto the form the model was trained against.
+fn normalize(word: string) -> string {
+    if str.Len(word) == 0 {
+        return word
+    }
+    first := word[0]
+    if first != 45 && str.IndexOf(word, "-") >= 0 {
+        return "!HYPHEN"
+    }
+    if str.Len(word) == 4 && isDecimalInt(word) {
+        return "!YEAR"
+    }
+    if first >= 48 && first <= 57 {
+        return "!DIGITS"
+    }
+    return toLowerFast(word)
+}
+
+// isDecimalInt reports whether s is an optional sign plus digits.
+fn isDecimalInt(s: string) -> bool {
+    i := 0
+    if s[0] == 43 || s[0] == 45 {
+        i = 1
+    }
+    if i == str.Len(s) {
+        return false
+    }
+    for i < str.Len(s) {
+        if s[i] < 48 || s[i] > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// toLowerFast avoids Unicode folding for already-lowercase ASCII.
+fn toLowerFast(s: string) -> string {
+    for i := 0; i < str.Len(s); i = i + 1 {
+        c := s[i]
+        if (c >= 65 && c <= 90) || c >= 128 {
+            return unicode.ToLowerStr(s)
+        }
+    }
+    return s
+}
+
+// newPerceptron constructs the bundled perceptron tagger for the registry.
+fn newPerceptron() -> (Interface, errors.Error) {
+    return New()
+}
+
+// New returns a perceptron tagger backed by the bundled English model.
+pub fn New() -> (Interface, errors.Error) {
+    return NewOpts([]fn(*Tagger){})
+}
+
+// NewOpts is New configured by options — New(opts...) in the reference.
+pub fn NewOpts(opts: []fn(*Tagger)) -> (Interface, errors.Error) {
+    path := modelpath.FindModel("tag/en.bin")
+    if path == "" {
+        var t Tagger
+        return &t, errors.New("cannot locate tag/en.bin; set SKINK_VOX_MODELS")
+    }
+    return FromFileOpts(path, opts)
+}
+
+// FromFile returns a perceptron tagger backed by a model file on disk.
+pub fn FromFile(path: string) -> (Interface, errors.Error) {
+    return FromFileOpts(path, []fn(*Tagger){})
+}
+
+// FromFileOpts is FromFile configured by options.
+pub fn FromFileOpts(path: string, opts: []fn(*Tagger)) -> (Interface, errors.Error) {
+    if !fs.IsFile(path) {
+        var t Tagger
+        return &t, errors.New(str.Concat("model file not found: ", path))
+    }
+    size := int(fs.FileSize(path))
+    f, err := fs.Open(path, "rb")
+    if err.message != "" {
+        var t Tagger
+        return &t, err
+    }
+    buf := libc.malloc(size)
+    n := f.Read(buf, size)
+    f.Close()
+    if n != size {
+        var t Tagger
+        return &t, errors.New(str.Concat("short read on model file: ", path))
+    }
+    return FromBytesOpts(buf, size, opts)
+}
+
+// FromBytes returns a perceptron tagger backed by model bytes already in
+// memory. The data must stay alive for the tagger's lifetime — the model
+// borrows it rather than copying.
+pub fn FromBytes(data: string, size: int) -> (Interface, errors.Error) {
+    return FromBytesOpts(data, size, []fn(*Tagger){})
+}
+
+// FromBytesOpts is FromBytes configured by options.
+pub fn FromBytesOpts(data: string, size: int, opts: []fn(*Tagger)) -> (Interface, errors.Error) {
+    m, err := flat.Unmarshal(data, size)
+    t := Tagger{model: m}
+    for i := 0; i < len(opts); i = i + 1 {
+        opts[i](&t)
+    }
+    return &t, err
+}
+
+// matchNoneRe implements the treebank none-token pattern
+// ^(?:0|\*[\w?]\*|\*\-\d{1,3}|\*[A-Z]+\*\-\d{1,3}|\*)$.
+fn matchNoneRe(s: string) -> bool {
+    n := str.Len(s)
+    if n == 0 {
+        return false
+    }
+    if s == "0" || s == "*" {
+        return true
+    }
+    if s[0] != 42 { // '*'
+        return false
+    }
+    // \*[\w?]\* — "*X*" where X is a word char or '?'.
+    if n == 3 && s[2] == 42 && (isWordByte(s[1]) || s[1] == 63) {
+        return true
+    }
+    // \*\-\d{1,3} — "*-" followed by 1-3 digits.
+    if n >= 3 && s[1] == 45 {
+        nd := digitsAt(s, 2)
+        if nd >= 1 && nd <= 3 && 2 + nd == n {
+            return true
+        }
+    }
+    // \*[A-Z]+\*\-\d{1,3} — "*", uppercase+, "*-", 1-3 digits.
+    j := 1
+    for j < n && s[j] >= 65 && s[j] <= 90 {
+        j = j + 1
+    }
+    if j > 1 && j + 1 < n && s[j] == 42 && s[j + 1] == 45 {
+        nd := digitsAt(s, j + 2)
+        if nd >= 1 && nd <= 3 && j + 2 + nd == n {
+            return true
+        }
+    }
+    return false
+}
+
+// digitsAt counts consecutive ASCII digits starting at i.
+fn digitsAt(s: string, i: int) -> int {
+    n := 0
+    for i + n < str.Len(s) && s[i + n] >= 48 && s[i + n] <= 57 {
+        n = n + 1
+    }
+    return n
+}
+
+// isWordByte reports whether b is [0-9A-Za-z_].
+fn isWordByte(b: int) -> bool {
+    return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) ||
+        (b >= 97 && b <= 122) || b == 95
+}
+
+// matchKeepRe implements ^-[A-Z]{3}-$ — e.g. "-LRB-".
+fn matchKeepRe(s: string) -> bool {
+    n := str.Len(s)
+    if n != 5 || s[0] != 45 || s[4] != 45 {
+        return false
+    }
+    for i := 1; i <= 3; i = i + 1 {
+        if !(s[i] >= 65 && s[i] <= 90) {
+            return false
+        }
+    }
+    return true
+}
+
+// ============================================================================
+// Lexical — a lexicon-backed tagger
+// ============================================================================
+
+// Lexical is an Interface backed by a caller-supplied dictionary mapping
+// each word to the tags it can take. A single tag is applied directly;
+// several defer to the fallback's contextual answer within the list.
+pub struct Lexical {
+    entries:  map[string][]string
+    fallback: Interface
+
+    // Tag tags words using the dictionary, falling back on misses.
+    pub fn Tag(l: *Lexical, words: []string) -> []token.Token {
+        var out []token.Token
+        for i := 0; i < len(words); i = i + 1 {
+            out = append(out, token.Token{Text: words[i]})
+        }
+        l.TagTokens(out)
+        return out
+    }
+
+    // TagTokens fills in the Tag field of each token. The fallback runs over
+    // the whole sentence rather than word by word: it reads the tags around
+    // each word, so handing it only unplaced words would leave holes.
+    pub fn TagTokens(l: *Lexical, tokens: []token.Token) {
+        if len(tokens) == 0 {
+            return
+        }
+
+        l.fallback.TagTokens(tokens)
+
+        for i := 0; i < len(tokens); i = i + 1 {
+            tags := l.lookupTag(tokens[i].Text)
+            if len(tags) == 0 {
+                continue
+            }
+
+            // One possibility: the dictionary decides.
+            if len(tags) == 1 {
+                tokens[i].Tag = tags[0]
+                continue
+            }
+
+            // Several: keep the fallback's answer when it is among them,
+            // since context is what tells them apart.
+            if strContains(tags, tokens[i].Tag) {
+                continue
+            }
+
+            // The fallback chose a reading the dictionary does not list --
+            // prefer a listed tag of the same class over the first one.
+            same, ok := sameClassTag(tags, tokens[i].Tag)
+            if ok {
+                tokens[i].Tag = same
+                continue
+            }
+
+            tokens[i].Tag = tags[0]
+        }
+    }
+
+    // lookupTag finds a word, trying it as written before its lower-case
+    // form so one entry covers every casing.
+    fn lookupTag(l: *Lexical, word: string) -> []string {
+        tags, ok := l.entries[word]
+        if ok {
+            return tags
+        }
+        lower := unicode.ToLowerStr(word)
+        if lower == word {
+            return []string{}
+        }
+        tags2, ok2 := l.entries[lower]
+        if !ok2 {
+            return []string{}
+        }
+        return tags2
+    }
+
+    // Name returns the tagger's identifier.
+    pub fn Name(l: *Lexical) -> string {
+        return "lexical"
+    }
+}
+
+// strContains reports whether needle is an element of haystack.
+fn strContains(haystack: []string, needle: string) -> bool {
+    for i := 0; i < len(haystack); i = i + 1 {
+        if haystack[i] == needle {
+            return true
+        }
+    }
+    return false
+}
+
+// sameClassTag finds a tag among tags that names the same part of speech as
+// want, ignoring finer Penn distinctions (NN/NNS, VB/VBD/VBG, ...).
+fn sameClassTag(tags: []string, want: string) -> (string, bool) {
+    class := classOfTag(want)
+    if class == "" {
+        return "", false
+    }
+    for i := 0; i < len(tags); i = i + 1 {
+        if classOfTag(tags[i]) == class {
+            return tags[i], true
+        }
+    }
+    return "", false
+}
+
+// classOfTag reduces a Penn tag to the part of speech it names.
+fn classOfTag(tag: string) -> string {
+    if str.StartsWith(tag, "NNP") {
+        return "NNP"
+    }
+    if str.StartsWith(tag, "NN") {
+        return "NN"
+    }
+    if str.StartsWith(tag, "VB") {
+        return "VB"
+    }
+    if str.StartsWith(tag, "JJ") {
+        return "JJ"
+    }
+    if str.StartsWith(tag, "RB") {
+        return "RB"
+    }
+    if str.StartsWith(tag, "PRP") {
+        return "PRP"
+    }
+    return tag
+}
+
+// NewLexical builds a dictionary-driven tagger; fallback handles unknown and
+// ambiguous words.
+pub fn NewLexical(entries: map[string][]string, fallback: Interface) -> (Lexical, errors.Error) {
+    if len(entries) == 0 {
+        var z Lexical
+        return z, errors.New("tag: a lexical tagger needs a dictionary")
+    }
+    return Lexical{entries: entries, fallback: fallback}, errors.None()
+}
+
+// NewLexicalDefault builds a dictionary-driven tagger whose fallback is the
+// default perceptron tagger.
+pub fn NewLexicalDefault(entries: map[string][]string) -> (Lexical, errors.Error) {
+    if len(entries) == 0 {
+        var z Lexical
+        return z, errors.New("tag: a lexical tagger needs a dictionary")
+    }
+    fb, err := New()
+    if err.message != "" {
+        var z Lexical
+        return z, err
+    }
+    return Lexical{entries: entries, fallback: fb}, errors.None()
+}
+
+// ReadDictionary parses a dictionary body of one word per line:
+//
+// 	aware	JJ
+// 	code	NN	VB
+//
+// Fields are tab-separated: the word, then every tag it can take, most
+// common first. Blank lines and lines beginning with # are ignored.
+pub fn ReadDictionary(text: string) -> (map[string][]string, errors.Error) {
+    entries := make(map[string][]string)
+    lines := str.Split(text, "\n")
+    for ln := 0; ln < len(lines); ln = ln + 1 {
+        line := str.Trim(lines[ln])
+        if line == "" || str.StartsWith(line, "#") {
+            continue
+        }
+        fields := str.Split(line, "\t")
+        if len(fields) < 2 {
+            var m map[string][]string
+            return m, errors.New("tag: want a word and at least one tag")
+        }
+        word := str.Trim(fields[0])
+        var tags []string
+        for i := 1; i < len(fields); i = i + 1 {
+            f := str.Trim(fields[i])
+            if f != "" {
+                tags = append(tags, f)
+            }
+        }
+        if word == "" || len(tags) == 0 {
+            var m map[string][]string
+            return m, errors.New("tag: want a word and at least one tag")
+        }
+        entries[word] = tags
+    }
+    return entries, errors.None()
+}
+
+// LexicalFromFile loads a dictionary file — see ReadDictionary for format.
+pub fn LexicalFromFile(path: string) -> (map[string][]string, errors.Error) {
+    data, err := fs.ReadAll(path)
+    if err.message != "" {
+        var m map[string][]string
+        return m, err
+    }
+    return ReadDictionary(data)
+}
+
+// ============================================================================
+// Registry — taggers by name
+// ============================================================================
+
+// registryEntry pairs a name with its constructor.
+struct registryEntry {
+    name:    string
+    factory: fn() -> (Interface, errors.Error)
+}
+
+var registry []registryEntry
+var registryInit = false
+
+// ensureRegistry lazily installs the built-in taggers.
+fn ensureRegistry() {
+    if registryInit {
+        return
+    }
+    registryInit = true
+    registry = append(registry, registryEntry{name: "perceptron", factory: newPerceptron})
+}
+
+// Register adds a tagger factory to the registry under name.
+pub fn Register(name: string, factory: fn() -> (Interface, errors.Error)) {
+    ensureRegistry()
+    registry = append(registry, registryEntry{name: name, factory: factory})
+}
+
+// Names returns the sorted list of registered tagger names.
+pub fn Names() -> []string {
+    ensureRegistry()
+    var names []string
+    for i := 0; i < len(registry); i = i + 1 {
+        names = append(names, registry[i].name)
+    }
+    sort.SortStrings(names)
+    return names
+}
+
+// Open returns a tagger by name, or an error if the name is not registered.
+pub fn Open(name: string) -> (Interface, errors.Error) {
+    ensureRegistry()
+    for i := 0; i < len(registry); i = i + 1 {
+        if registry[i].name == name {
+            return registry[i].factory()
+        }
+    }
+    var t Tagger
+    return &t, errors.New(str.Concat("tagger not found: ", str.Concat(name, str.Concat(" (available: ", str.Concat(str.Join(Names(), ", "), ")")))))
+}

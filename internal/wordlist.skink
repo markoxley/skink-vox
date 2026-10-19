@@ -1,0 +1,34 @@
+// File:    internal/wordlist.skink
+// Purpose: Ogden's Basic English word list, used as a feature by the entity
+//          recognizer. It is a set rather than a slice: the lookup is one of
+//          the recognizer's per-token features, so a linear scan would cost
+//          850 string comparisons per token.
+module wordlist
+
+import "internal/wordlist_data"
+import "std/hashmap"
+
+var basic = hashmap.New<string, int>()
+var loaded = false
+
+// ensure builds the set on first use.
+fn ensure() {
+    if loaded {
+        return
+    }
+    for i := 0; i < len(wordlist_data.Words); i = i + 1 {
+        basic.Put(wordlist_data.Words[i], 1)
+    }
+    loaded = true
+}
+
+// IsBasic reports whether word is in Ogden's Basic English list.
+pub fn IsBasic(word: string) -> bool {
+    ensure()
+    return basic.Has(word)
+}
+
+// Len returns the number of words in the list.
+pub fn Len() -> int {
+    return len(wordlist_data.Words)
+}

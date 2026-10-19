@@ -1,0 +1,1054 @@
+// File:    tokenize.skink
+// Purpose: Split text into tokens that know where they came from — a port of
+//          the reference implementation's tokenize package, including the
+//          RegexpTokenizer family and the TreebankWordTokenizer.
+//
+//          # Positions
+//
+//          Every token carries a byte offset into the input, and the
+//          invariant
+//
+//              src[tok.Start:tok.End()] == tok.Text
+//
+//          holds for all of them. Two design choices make that true by
+//          construction rather than by care:
+//
+//           1. The input is never rewritten before tokenizing. Normalizing
+//              curly quotes to straight ones, or "&rsquo;" to "'", changes
+//              byte lengths, so every offset measured against the rewritten
+//              copy is wrong for the original. Characters that would
+//              otherwise be normalized are handled directly by the prefix
+//              and suffix sets below.
+//
+//           2. Splitting carries offsets rather than recomputing them. Each
+//              split step slices both the text and its base offset, so a
+//              token's position is always a running sum, never the result of
+//              searching for the token's text in the source, which finds the
+//              wrong instance for any repeated word.
+module tokenize
+
+import "internal/emoticon"
+import "internal/unicode"
+import "std/regex"
+import "std/str"
+import "token"
+
+// Token is token.Token, re-exported so callers using only this
+// module do not have to import token themselves.
+pub type Token = token.Token
+
+// Tokenizer splits text into tokens.
+//
+// The affix tables are public so callers can adapt the tokenizer; the
+// defaults are prose's standard English behaviour.
+pub struct Tokenizer {
+    prefixes:   []string // characters split off the front of a token
+    suffixes:   []string // characters split off the end of a token
+    splitCases: []string // infixes that trigger a split (contractions)
+    isSpecial:  fn(string) -> bool // extra predicate for spans kept whole
+
+    // Tokenize splits text into tokens.
+    pub fn Tokenize(t: *Tokenizer, text: string) -> []token.Token {
+        var tokens []token.Token
+        start := 0
+        index := 0
+        length := str.Len(text)
+        if length == 0 {
+            return tokens
+        }
+        r0, _ := unicode.DecodeRune(text, 0)
+        white := unicode.IsSpace(r0)
+
+        for index <= length {
+            r, size := unicode.DecodeRune(text, index)
+            if size == 0 {
+                break
+            }
+            if unicode.IsSpace(r) != white {
+                if start < index {
+                    tokens = split(t, str.Substr(text, start, index - start), start, tokens)
+                }
+                if r == 32 {
+                    start = index + 1
+                } else {
+                    start = index
+                }
+                white = !white
+            }
+            index = index + size
+        }
+
+        if start < index {
+            tokens = split(t, str.Substr(text, start, index - start), start, tokens)
+        }
+
+        return tokens
+    }
+}
+
+// noSpecial is the default extra predicate: nothing extra is special.
+fn noSpecial(s: string) -> bool {
+    return false
+}
+
+// Option configures a Tokenizer — the counterpart of the reference
+// library's tokenize.Option. Skink has no variadic calls, so a set of
+// options is passed as a slice to NewTokenizerOpts.
+pub type Option = fn(*Tokenizer)
+
+// UsingPrefixes replaces the set of characters split off the front of a
+// token.
+pub fn UsingPrefixes(p: []string) -> fn(*Tokenizer) {
+    return fn(t: *Tokenizer) { t.prefixes = p }
+}
+
+// UsingSuffixes replaces the set of characters split off the end of a token.
+pub fn UsingSuffixes(s: []string) -> fn(*Tokenizer) {
+    return fn(t: *Tokenizer) { t.suffixes = s }
+}
+
+// UsingSplitCases replaces the set of infixes that trigger a split, such as
+// contraction endings.
+pub fn UsingSplitCases(c: []string) -> fn(*Tokenizer) {
+    return fn(t: *Tokenizer) { t.splitCases = c }
+}
+
+// UsingSpecialTest supplies an extra predicate for spans that must not be
+// split at all.
+pub fn UsingSpecialTest(f: fn(string) -> bool) -> fn(*Tokenizer) {
+    return fn(t: *Tokenizer) { t.isSpecial = f }
+}
+
+// NewTokenizer returns a Tokenizer with prose's default English behaviour.
+pub fn NewTokenizer() -> Tokenizer {
+    return Tokenizer{
+        prefixes:   defaultPrefixes(),
+        suffixes:   defaultSuffixes(),
+        splitCases: defaultContractions(),
+        isSpecial:  noSpecial,
+    }
+}
+
+// NewTokenizerOpts returns a Tokenizer configured by the given options.
+pub fn NewTokenizerOpts(opts: []fn(*Tokenizer)) -> Tokenizer {
+    t := NewTokenizer()
+    for i := 0; i < len(opts); i = i + 1 {
+        opts[i](&t)
+    }
+    return t
+}
+
+// internalRE matches spans like "U.S.A." (letter-dot: pairs) and short
+// abbreviations like "Mr." — implemented as a scanner since it is a fixed
+// pattern: ^(?:[A-Za-z]\.){2,}$ | ^[A-Z][a-z]{1,2}\.$
+fn isInternalAbbrev(span: string) -> bool {
+    n := str.Len(span)
+    if n == 0 {
+        return false
+    }
+    // ^[A-Z][a-z]{1,2}\.$
+    if n >= 3 && isUpper(span[0]) && isLower(span[1]) && span[n - 1] == 46 {
+        if n == 3 {
+            return true
+        }
+        if n == 4 && isLower(span[2]) {
+            return true
+        }
+    }
+    // ^(?:[A-Za-z]\.){2,}$
+    if n % 2 != 0 {
+        return false
+    }
+    i := 0
+    for i < n {
+        if !isLetter(span[i]) {
+            return false
+        }
+        if span[i + 1] != 46 {
+            return false
+        }
+        i = i + 2
+    }
+    return n >= 4
+}
+
+fn isLetter(c: int) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn isUpper(c: int) -> bool {
+    return c >= 65 && c <= 90
+}
+
+fn isLower(c: int) -> bool {
+    return c >= 97 && c <= 122
+}
+
+// blank reports whether s is empty or entirely whitespace.
+//
+// The scan above advances start past a single trailing space, so a run of
+// two or more leaves a whitespace-only span behind. Those are not tokens.
+fn blank(s: string) -> bool {
+    i := 0
+    n := str.Len(s)
+    for i < n {
+        r, size := unicode.DecodeRune(s, i)
+        if size < 1 {
+            size = 1
+        }
+        if !unicode.IsSpace(r) {
+            return false
+        }
+        i = i + size
+    }
+    return true
+}
+
+// split breaks one whitespace-delimited span into tokens.
+//
+// base is the span's byte offset in the original text; every offset produced
+// here is base plus a distance within the span, so positions stay anchored to
+// the source no matter how many times the span is subdivided.
+fn split(t: *Tokenizer, spanIn: string, baseIn: int, tokens: []token.Token) -> []token.Token {
+    span := spanIn
+    base := baseIn
+    if blank(span) {
+        return tokens
+    }
+
+    // Suffixes peel off the end, so they are collected in reverse and
+    // appended once the core of the span is resolved.
+    var suffixes []token.Token
+
+    for str.Len(span) > 0 {
+        if special(t, span) {
+            tokens = append(tokens, token.Token{Text: span, Start: base})
+            span = ""
+            break
+        }
+
+        p := matchPrefix(span, t.prefixes)
+        if p > 0 {
+            tokens = append(tokens, token.Token{Text: str.Substr(span, 0, p), Start: base})
+            span = str.Substr(span, p, str.Len(span) - p)
+            base = base + p
+            continue
+        }
+
+        idx := indexAnyCase(span, t.splitCases)
+        if idx > 0 {
+            // "they'll" -> "they" + "'ll"; "don't" -> "do" + "n't".
+            tokens = append(tokens, token.Token{Text: str.Substr(span, 0, idx), Start: base})
+            span = str.Substr(span, idx, str.Len(span) - idx)
+            base = base + idx
+            continue
+        }
+
+        s := matchSuffix(span, t.suffixes)
+        if s > 0 {
+            cut := str.Len(span) - s
+            suffixes = append(suffixes, token.Token{Text: str.Substr(span, cut, s), Start: base + cut})
+            span = str.Substr(span, 0, cut)
+            continue
+        }
+
+        tokens = append(tokens, token.Token{Text: span, Start: base})
+        span = ""
+    }
+
+    // Emit collected suffixes in source order.
+    for i := len(suffixes) - 1; i >= 0; i = i - 1 {
+        tokens = append(tokens, suffixes[i])
+    }
+    return tokens
+}
+
+// special reports whether a span must be kept whole.
+fn special(t: *Tokenizer, span: string) -> bool {
+    if emoticon.Is(span) {
+        return true
+    }
+    if isInternalAbbrev(span) {
+        return true
+    }
+    return t.isSpecial(span)
+}
+
+// matchPrefix returns the byte length of the leading prefix, or 0.
+fn matchPrefix(s: string, prefixes: []string) -> int {
+    for i := 0; i < len(prefixes); i = i + 1 {
+        p := prefixes[i]
+        if str.StartsWith(s, p) && str.Len(s) > str.Len(p) {
+            return str.Len(p)
+        }
+    }
+    return 0
+}
+
+// matchSuffix returns the byte length of the trailing suffix, or 0.
+fn matchSuffix(s: string, suffixes: []string) -> int {
+    for i := 0; i < len(suffixes); i = i + 1 {
+        suf := suffixes[i]
+        if str.EndsWith(s, suf) && str.Len(s) > str.Len(suf) {
+            return str.Len(suf)
+        }
+    }
+    return 0
+}
+
+// indexAnyCase returns the byte offset of the earliest split case in s,
+// compared case-insensitively, or -1.
+//
+// Only ASCII case is folded, which is all the default split cases need, and
+// it avoids allocating a lowercased copy of every span.
+fn indexAnyCase(s: string, cases: []string) -> int {
+    best := -1
+    for i := 0; i < len(cases); i = i + 1 {
+        j := indexFoldASCII(s, cases[i])
+        if j > 0 && (best == -1 || j < best) {
+            best = j
+        }
+    }
+    return best
+}
+
+// indexFoldASCII finds substr in s case-insensitively, or returns -1.
+fn indexFoldASCII(s: string, substr: string) -> int {
+    sl := str.Len(substr)
+    if sl == 0 || sl > str.Len(s) {
+        return -1
+    }
+    last := str.Len(s) - sl
+    for i := 0; i <= last; i = i + 1 {
+        if equalFoldASCII(str.Substr(s, i, sl), substr) {
+            return i
+        }
+    }
+    return -1
+}
+
+// equalFoldASCII reports whether a and b agree ignoring ASCII case.
+fn equalFoldASCII(a: string, b: string) -> bool {
+    for i := 0; i < str.Len(a); i = i + 1 {
+        ca := a[i]
+        cb := b[i]
+        if ca >= 65 && ca <= 90 {
+            ca = ca + 32
+        }
+        if cb >= 65 && cb <= 90 {
+            cb = cb + 32
+        }
+        if ca != cb {
+            return false
+        }
+    }
+    return true
+}
+
+// Both apostrophe forms are listed. Since the input is never rewritten, the
+// curly forms have to be recognized directly or "It’s" stays one token.
+fn defaultContractions() -> []string {
+    return []string{
+        "'ll", "'s", "'re", "'m", "n't",
+        "’ll", "’s", "’re", "’m", "n’t",
+    }
+}
+
+// The curly variants are here rather than in a pre-pass replacer: rewriting
+// them to ASCII before tokenizing would shift every subsequent offset.
+// Handling them as ordinary affixes keeps the input intact.
+fn defaultSuffixes() -> []string {
+    return []string{
+        ",", ")", "\"", "]", "!", ";", ".", "?", ":", "'",
+        "”", // right double quotation mark
+        "’", // right single quotation mark
+    }
+}
+
+fn defaultPrefixes() -> []string {
+    return []string{
+        "$", "(", "\"", "[",
+        "“", // left double quotation mark
+        "‘", // left single quotation mark
+    }
+}
+
+// --- RegexpTokenizer ---------------------------------------------------------
+
+// RegexpTokenizer splits a string into substrings using a regular
+// expression. Patterns use POSIX extended syntax.
+pub struct RegexpTokenizer {
+    regex:   regex.Regex
+    gaps:    bool // match separators between tokens rather than the tokens
+    discard: bool // discard empty tokens produced by gap splitting
+
+    // TokenizeRegexp splits text into a slice of token strings according to the
+    // tokenizer's pattern.
+    pub fn Tokenize(r: RegexpTokenizer, text: string) -> []string {
+        var tokens []string
+        if r.gaps {
+            temp := splitOnMatches(r.regex, text)
+            if r.discard {
+                for i := 0; i < len(temp); i = i + 1 {
+                    if temp[i] != "" {
+                        tokens = append(tokens, temp[i])
+                    }
+                }
+            } else {
+                tokens = temp
+            }
+        } else {
+            matches := r.regex.FindAll(text)
+            for i := 0; i < len(matches); i = i + 1 {
+                tokens = append(tokens, matches[i].Text)
+            }
+        }
+        return tokens
+    }
+}
+
+// NewRegexpTokenizer is a RegexpTokenizer constructor that takes a pattern
+// to base the tokenizer on, a boolean indicating whether to look for
+// separators between tokens, and a boolean indicating whether to discard
+// empty tokens.
+pub fn NewRegexpTokenizer(pattern: string, gaps: bool, discard: bool) -> RegexpTokenizer {
+    r := regex.MustCompile(pattern)
+    return RegexpTokenizer{regex: r, gaps: gaps, discard: discard}
+}
+
+// splitOnMatches splits text around every match of re — the gaps mode of a
+// regexp tokenizer.
+fn splitOnMatches(re: regex.Regex, text: string) -> []string {
+    matches := re.FindAll(text)
+    var out []string
+    pos := 0
+    for i := 0; i < len(matches); i = i + 1 {
+        out = append(out, str.Substr(text, pos, matches[i].Start - pos))
+        pos = matches[i].End
+    }
+    out = append(out, str.Substr(text, pos, str.Len(text) - pos))
+    return out
+}
+
+// --- blankline tokenizer ------------------------------------------------------
+
+// isGoSpace reports whether b is one of the regexp \s bytes [\t\n\f\r ].
+fn isGoSpace(b: int) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 12 || b == 13
+}
+
+// NewBlanklineTokenizer returns a tokenizer that splits on any sequence of
+// blank lines: runs of \s containing at least two newlines.
+//
+// Implemented as a scanner so the whitespace set matches [\t\n\f\r ] exactly
+// (POSIX [[:space:]] would also admit \v).
+pub fn NewBlanklineTokenizer() -> BlanklineTokenizer {
+    return BlanklineTokenizer{}
+}
+
+// BlanklineTokenizer splits text on blank lines.
+pub struct BlanklineTokenizer {
+    dummy: int
+
+    // TokenizeBlankline splits text on blank-line runs.
+    pub fn Tokenize(t: BlanklineTokenizer, text: string) -> []string {
+        var tokens []string
+        pos := 0
+        i := 0
+        n := str.Len(text)
+        for i < n {
+            // A gap is a run of \s bytes containing at least two '\n'.
+            if isGoSpace(text[i]) {
+                j := i
+                newlines := 0
+                for j < n && isGoSpace(text[j]) {
+                    if text[j] == 10 {
+                        newlines = newlines + 1
+                    }
+                    j = j + 1
+                }
+                if newlines >= 2 {
+                    tokens = append(tokens, str.Substr(text, pos, i - pos))
+                    i = j
+                    pos = j
+                    continue
+                }
+                i = j
+                continue
+            }
+            i = i + 1
+        }
+        tokens = append(tokens, str.Substr(text, pos, n - pos))
+        var out []string
+        for i := 0; i < len(tokens); i = i + 1 {
+            if tokens[i] != "" {
+                out = append(out, tokens[i])
+            }
+        }
+        return out
+    }
+}
+
+// --- WordPunct tokenizer ------------------------------------------------------
+
+// isWordByte reports whether b is a \w byte: [0-9A-Za-z_].
+fn isWordByte(b: int) -> bool {
+    return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) ||
+        (b >= 97 && b <= 122) || b == 95
+}
+
+// NewWordPunctTokenizer returns a tokenizer that splits text into a sequence
+// of alphabetic and non-alphabetic characters — the regexp
+// \w+|[^\w\s]+.
+pub fn NewWordPunctTokenizer() -> WordPunctTokenizer {
+    return WordPunctTokenizer{}
+}
+
+// WordPunctTokenizer splits on word/punctuation runs.
+pub struct WordPunctTokenizer {
+    dummy: int
+
+    // TokenizeWordPunct tokenizes text as maximal runs of word bytes
+    // ([0-9A-Za-z_]) and runs of non-word non-space bytes.
+    pub fn Tokenize(t: WordPunctTokenizer, text: string) -> []string {
+        var tokens []string
+        n := str.Len(text)
+        i := 0
+        for i < n {
+            b := text[i]
+            if isGoSpace(b) {
+                i = i + 1
+                continue
+            }
+            j := i
+            if isWordByte(b) {
+                for j < n && isWordByte(text[j]) {
+                    j = j + 1
+                }
+            } else {
+                for j < n && !isWordByte(text[j]) && !isGoSpace(text[j]) {
+                    j = j + 1
+                }
+            }
+            tokens = append(tokens, str.Substr(text, i, j - i))
+            i = j
+        }
+        return tokens
+    }
+}
+
+// --- WordBoundary tokenizer ---------------------------------------------------
+
+// isWordBoundaryRune reports whether r is in [\p{N}\p{L}'].
+fn isWordBoundaryRune(r: int) -> bool {
+    return r == 39 || unicode.IsLetter(r) || unicode.IsNumber(r)
+}
+
+// NewWordBoundaryTokenizer returns a tokenizer that splits text into a
+// sequence of word-like tokens — the regexp (?:[A-Z]\.){2,}|[\p{N}\p{L}']+.
+pub fn NewWordBoundaryTokenizer() -> WordBoundaryTokenizer {
+    return WordBoundaryTokenizer{}
+}
+
+// WordBoundaryTokenizer extracts word-like tokens.
+pub struct WordBoundaryTokenizer {
+    dummy: int
+
+    // TokenizeWordBoundary extracts initialisms (A.B.C.) and runs of Unicode
+    // letters, numbers, and apostrophes.
+    pub fn Tokenize(t: WordBoundaryTokenizer, text: string) -> []string {
+        var tokens []string
+        n := str.Len(text)
+        i := 0
+        for i < n {
+            // Alternative 1: (?:[A-Z]\.){2,} — maximal run of Capital+dot pairs.
+            if text[i] >= 65 && text[i] <= 90 && i + 1 < n && text[i + 1] == 46 {
+                j := i
+                for j + 1 < n && text[j] >= 65 && text[j] <= 90 && text[j + 1] == 46 {
+                    j = j + 2
+                }
+                if j - i >= 4 {
+                    tokens = append(tokens, str.Substr(text, i, j - i))
+                    i = j
+                    continue
+                }
+            }
+            // Alternative 2: [\p{N}\p{L}']+ — maximal run of word runes.
+            r, size := unicode.DecodeRune(text, i)
+            if size < 1 {
+                size = 1
+                r = -1
+            }
+            if r >= 0 && isWordBoundaryRune(r) {
+                j := i
+                for j < n {
+                    rr, sz := unicode.DecodeRune(text, j)
+                    if sz < 1 {
+                        sz = 1
+                    }
+                    if !isWordBoundaryRune(rr) {
+                        break
+                    }
+                    j = j + sz
+                }
+                tokens = append(tokens, str.Substr(text, i, j - i))
+                i = j
+                continue
+            }
+            i = i + size
+        }
+        return tokens
+    }
+}
+
+// --- TreebankWordTokenizer ----------------------------------------------------
+
+// TreebankWordTokenizer splits a sentence into words, a port of the Sed
+// script by Robert McIntyre. Each regexp substitution in the reference
+// implementation is a fixed pattern, so they are implemented here as
+// dedicated scanners with the same replacements.
+//
+// NOTE: this tokenizer expects a sentence (not raw: text) as input.
+pub struct TreebankWordTokenizer {
+    dummy: int
+
+    // TokenizeTreebank splits a sentence into a slice of words.
+    //
+    // The steps: (1) split on contractions ("don't" -> [do n't]), (2) split on
+    // non-terminating punctuation, (3) split on single quotes when followed by
+    // whitespace, and (4) split on periods that appear at the end of lines.
+    pub fn Tokenize(t: TreebankWordTokenizer, textIn: string) -> []string {
+        text := textIn
+
+        // starting quotes
+        text = subQuoteSep(text)
+        if str.Len(text) > 0 && text[0] == 34 {
+            text = str.Concat("``", str.Substr(text, 1, str.Len(text) - 1))
+        }
+        text = subAll(text, " \"", " ``")
+        text = subAll(text, "``", " `` ")
+
+        // punctuation
+        text = subCommaNonDigit(text)
+        text = subAll(text, "...", " ... ")
+        text = subFinalPeriod(text)
+        text = subQuoteSpace(text)
+        text = subEndPunct(text)
+        text = subPunctChars(text)
+
+        // brackets
+        text = subBrackets(text)
+        text = subAll(text, "--", " -- ")
+
+        text = str.Concat(" ", str.Concat(text, " "))
+
+        // ending quotes
+        text = subDoubleQuotes(text)
+        text = subEndQuote1(text)
+        text = subContractionTail(text, []string{"'s", "'S", "'m", "'M", "'d", "'D", "'"})
+        text = subContractionTail(text, []string{"'ll", "'LL", "'re", "'RE", "'ve", "'VE", "n't", "N'T"})
+
+        // word contractions
+        text = subWordContract(text, "can", "not", false, false)
+        text = subWordContract(text, "d", "'ye", false, false)
+        text = subWordContract(text, "gim", "me", false, false)
+        text = subWordContract(text, "gon", "na", false, false)
+        text = subWordContract(text, "got", "ta", false, false)
+        text = subWordContract(text, "lem", "me", false, false)
+        text = subWordContract(text, "mor", "'n", false, false)
+        text = subWordContract(text, "wan", "na", false, true)
+        text = subWordContract(text, "'t", "is", true, false)
+        text = subWordContract(text, "'t", "was", true, false)
+
+        // newlines and runs of spaces
+        text = subAll(text, "\n", " ")
+        text = subAll(text, "\r", " ")
+        text = collapseSpaces(text)
+        text = trimUnicodeSpace(text)
+
+        if text == "" {
+            var empty []string
+            return empty
+        }
+        return str.Split(text, " ")
+    }
+}
+
+// NewTreebankWordTokenizer is a TreebankWordTokenizer constructor.
+pub fn NewTreebankWordTokenizer() -> TreebankWordTokenizer {
+    return TreebankWordTokenizer{}
+}
+
+// isTreebankSep reports whether b is one of " (\[{<" — the context that
+// makes an apostrophe a starting quote.
+fn isTreebankSep(b: int) -> bool {
+    return b == 32 || b == 40 || b == 91 || b == 123 || b == 60
+}
+
+// subQuoteSep replaces `'([ (\[{<])"` with "$1 `` ".
+fn subQuoteSep(text: string) -> string {
+    b := str.NewBuilder(str.Len(text) + 16)
+    i := 0
+    n := str.Len(text)
+    for i < n {
+        if i + 2 < n && text[i] == 39 && isTreebankSep(text[i + 1]) && text[i + 2] == 34 {
+            str.WriteByte(&b, text[i + 1])
+            str.Write(&b, " `` ")
+            i = i + 3
+            continue
+        }
+        str.WriteByte(&b, text[i])
+        i = i + 1
+    }
+    return str.String(b)
+}
+
+// subAll replaces every non-overlapping occurrence of needle with repl.
+fn subAll(text: string, needle: string, repl: string) -> string {
+    return str.Replace(text, needle, repl)
+}
+
+// subCommaNonDigit replaces `([:,])([^\d])` with " $1 $2 ". The second group
+// is a rune, so multi-byte characters are consumed whole.
+fn subCommaNonDigit(text: string) -> string {
+    b := str.NewBuilder(str.Len(text) + 16)
+    i := 0
+    n := str.Len(text)
+    for i < n {
+        c := text[i]
+        if (c == 44 || c == 58) && i + 1 < n {
+            r, size := unicode.DecodeRune(text, i + 1)
+            if size < 1 {
+                size = 1
+            }
+            if !(r >= 48 && r <= 57) {
+                str.Write(&b, " ")
+                str.WriteByte(&b, c)
+                str.Write(&b, " ")
+                str.Write(&b, str.Substr(text, i + 1, size))
+                i = i + 1 + size
+                continue
+            }
+        }
+        str.WriteByte(&b, c)
+        i = i + 1
+    }
+    return str.String(b)
+}
+
+// subFinalPeriod replaces `([^\.])(\.)([\]\)}>"\']*)\s*$` with "$1 $2$3 ".
+// Anchored at end: non-dot rune + '.' + closing chars + trailing whitespace.
+fn subFinalPeriod(text: string) -> string {
+    n := str.Len(text)
+    end := n
+    // trailing \s*
+    for end > 0 && isGoSpace(text[end - 1]) {
+        end = end - 1
+    }
+    // closing chars [\]\)}>"']
+    k := end
+    for k > 0 {
+        c := text[k - 1]
+        if c == 93 || c == 41 || c == 125 || c == 62 || c == 34 || c == 39 {
+            k = k - 1
+            continue
+        }
+        break
+    }
+    closers := str.Substr(text, k, end - k)
+    if k < 2 || text[k - 1] != 46 {
+        return text
+    }
+    // rune before the dot must not be '.'
+    r, size := unicode.DecodeLastRune(text, k - 1)
+    if size < 1 {
+        size = 1
+    }
+    if r == 46 {
+        return text
+    }
+    head := str.Substr(text, k - 1 - size, size)
+    b := str.NewBuilder(n + 4)
+    str.Write(&b, str.Substr(text, 0, k - 1 - size))
+    str.Write(&b, head)
+    str.Write(&b, " .")
+    str.Write(&b, closers)
+    str.Write(&b, " ")
+    return str.String(b)
+}
+
+// subQuoteSpace replaces `([^'])' ` with "$1 ' ".
+fn subQuoteSpace(text: string) -> string {
+    b := str.NewBuilder(str.Len(text) + 8)
+    i := 0
+    n := str.Len(text)
+    for i + 2 <= n && i < n {
+        if i + 2 <= n && i > 0 && text[i] == 39 && text[i + 1] == 32 &&
+            text[i - 1] != 39 {
+            // previous byte is the tail of the prior rune — a multi-byte
+            // rune is never 39, so checking the byte is safe.
+            str.Write(&b, " ' ")
+            i = i + 2
+            continue
+        }
+        str.WriteByte(&b, text[i])
+        i = i + 1
+    }
+    for i < n {
+        str.WriteByte(&b, text[i])
+        i = i + 1
+    }
+    return str.String(b)
+}
+
+// subEndPunct replaces `([:,])$` with " $1 ".
+fn subEndPunct(text: string) -> string {
+    n := str.Len(text)
+    if n > 0 && (text[n - 1] == 44 || text[n - 1] == 58) {
+        b := str.NewBuilder(n + 4)
+        str.Write(&b, str.Substr(text, 0, n - 1))
+        str.Write(&b, " ")
+        str.WriteByte(&b, text[n - 1])
+        str.Write(&b, " ")
+        return str.String(b)
+    }
+    return text
+}
+
+// subPunctChars replaces `([;@#$%&?!])` with " $1 ".
+fn subPunctChars(text: string) -> string {
+    b := str.NewBuilder(str.Len(text) + 32)
+    i := 0
+    n := str.Len(text)
+    for i < n {
+        c := text[i]
+        if c == 59 || c == 64 || c == 35 || c == 36 || c == 37 || c == 38 ||
+            c == 63 || c == 33 {
+            str.Write(&b, " ")
+            str.WriteByte(&b, c)
+            str.Write(&b, " ")
+            i = i + 1
+            continue
+        }
+        str.WriteByte(&b, c)
+        i = i + 1
+    }
+    return str.String(b)
+}
+
+// subBrackets replaces `([\]\[\(\)\{\}\<\>])` with " $1 ".
+fn subBrackets(text: string) -> string {
+    b := str.NewBuilder(str.Len(text) + 32)
+    i := 0
+    n := str.Len(text)
+    for i < n {
+        c := text[i]
+        if c == 93 || c == 91 || c == 40 || c == 41 || c == 123 || c == 125 ||
+            c == 60 || c == 62 {
+            str.Write(&b, " ")
+            str.WriteByte(&b, c)
+            str.Write(&b, " ")
+            i = i + 1
+            continue
+        }
+        str.WriteByte(&b, c)
+        i = i + 1
+    }
+    return str.String(b)
+}
+
+// subDoubleQuotes replaces `"` with " '' ".
+fn subDoubleQuotes(text: string) -> string {
+    return subAll(text, "\"", " '' ")
+}
+
+// subEndQuote1 replaces `'(\S)(\'\')'` with "$1 $2 " — that is, a match of
+// apostrophe + non-space rune + two apostrophes + apostrophe becomes the rune
+// followed by " '' ".
+fn subEndQuote1(text: string) -> string {
+    b := str.NewBuilder(str.Len(text) + 8)
+    i := 0
+    n := str.Len(text)
+    for i < n {
+        if text[i] == 39 {
+            _, size := unicode.DecodeRune(text, i + 1)
+            if size < 1 {
+                size = 1
+            }
+            j := i + 1 + size
+            if j + 2 < n && !isGoSpaceRune(text, i + 1) &&
+                text[j] == 39 && text[j + 1] == 39 && text[j + 2] == 39 {
+                str.Write(&b, str.Substr(text, i + 1, size))
+                str.Write(&b, " '' ")
+                i = j + 3
+                continue
+            }
+        }
+        str.WriteByte(&b, text[i])
+        i = i + 1
+    }
+    return str.String(b)
+}
+
+// isGoSpaceRune reports whether the rune starting at text[i] is \s.
+fn isGoSpaceRune(text: string, i: int) -> bool {
+    r, _ := unicode.DecodeRune(text, i)
+    // \s is ASCII only.
+    return r == 32 || r == 9 || r == 10 || r == 12 || r == 13
+}
+
+// subContractionTail replaces `([^' ])('XX|'') ` with "$1 $2 " where tails is
+// the list of allowed contraction tails (matched ASCII case-sensitively as
+// listed).
+fn subContractionTail(text: string, tails: []string) -> string {
+    b := str.NewBuilder(str.Len(text) + 8)
+    i := 0
+    n := str.Len(text)
+    for i < n {
+        matched := false
+        if i > 0 && text[i - 1] != 39 && text[i - 1] != 32 {
+            for t := 0; t < len(tails); t = t + 1 {
+                tail := tails[t]
+                tl := str.Len(tail)
+                if i + tl < n && str.Substr(text, i, tl) == tail &&
+                    text[i + tl] == 32 {
+                    str.Write(&b, " ")
+                    str.Write(&b, tail)
+                    str.Write(&b, " ")
+                    i = i + tl + 1
+                    matched = true
+                    break
+                }
+            }
+        }
+        if matched {
+            continue
+        }
+        str.WriteByte(&b, text[i])
+        i = i + 1
+    }
+    return str.String(b)
+}
+
+// isWordByteAt reports whether byte i of text is [0-9A-Za-z_]. Byte-level is
+// correct here: \b is defined on \w, which is ASCII-only.
+fn isWordByteAt(text: string, i: int) -> bool {
+    if i < 0 || i >= str.Len(text) {
+        return false
+    }
+    return isWordByte(text[i])
+}
+
+// foldAt reports whether text[i:i+len(word)] equals word, ASCII case-folded.
+fn foldAt(text: string, i: int, word: string) -> bool {
+    wl := str.Len(word)
+    if i + wl > str.Len(text) {
+        return false
+    }
+    for k := 0; k < wl; k = k + 1 {
+        a := text[i + k]
+        b := word[k]
+        if a >= 65 && a <= 90 {
+            a = a + 32
+        }
+        if b >= 65 && b <= 90 {
+            b = b + 32
+        }
+        if a != b {
+            return false
+        }
+    }
+    return true
+}
+
+// subWordContract replaces `(?i)\b(w1)(w2)\b`-style patterns with " w1 w2 ".
+// leadIn selects a leading literal (space) if the rule requires one.
+fn subWordContract(text: string, w1: string, w2: string, needLeadSpace: bool, needTailSpace: bool) -> string {
+    whole := str.Concat(w1, w2)
+    wl := str.Len(whole)
+    b := str.NewBuilder(str.Len(text) + 16)
+    i := 0
+    n := str.Len(text)
+    for i < n {
+        start := i
+        if needLeadSpace {
+            if text[i] != 32 {
+                str.WriteByte(&b, text[i])
+                i = i + 1
+                continue
+            }
+            start = i + 1
+        }
+        if start + wl <= n && foldAt(text, start, whole) &&
+            !isWordByteAt(text, start - 1) &&
+            (needTailSpace || !isWordByteAt(text, start + wl)) {
+            if needTailSpace {
+                if start + wl >= n || text[start + wl] != 32 {
+                    str.WriteByte(&b, text[i])
+                    i = i + 1
+                    continue
+                }
+            }
+            str.Write(&b, " ")
+            str.Write(&b, str.Substr(text, start, str.Len(w1)))
+            str.Write(&b, " ")
+            str.Write(&b, str.Substr(text, start + str.Len(w1), str.Len(w2)))
+            str.Write(&b, " ")
+            i = start + wl
+            if needTailSpace {
+                i = i + 1
+            }
+            continue
+        }
+        if needLeadSpace {
+            str.WriteByte(&b, text[i])
+            i = i + 1
+        } else {
+            str.WriteByte(&b, text[i])
+            i = i + 1
+        }
+    }
+    return str.String(b)
+}
+
+// collapseSpaces replaces runs of two or more spaces with one.
+fn collapseSpaces(text: string) -> string {
+    b := str.NewBuilder(str.Len(text))
+    i := 0
+    n := str.Len(text)
+    for i < n {
+        if text[i] == 32 && i + 1 < n && text[i + 1] == 32 {
+            for i < n && text[i] == 32 {
+                i = i + 1
+            }
+            str.WriteByte(&b, 32)
+            continue
+        }
+        str.WriteByte(&b, text[i])
+        i = i + 1
+    }
+    return str.String(b)
+}
+
+// trimUnicodeSpace trims Unicode whitespace from both ends.
+fn trimUnicodeSpace(s: string) -> string {
+    start := 0
+    n := str.Len(s)
+    for start < n {
+        r, size := unicode.DecodeRune(s, start)
+        if size < 1 || !unicode.IsSpace(r) {
+            break
+        }
+        start = start + size
+    }
+    end := n
+    for end > start {
+        r, size := unicode.DecodeLastRune(s, end)
+        if size < 1 || !unicode.IsSpace(r) {
+            break
+        }
+        end = end - size
+    }
+    return str.Substr(s, start, end - start)
+}
+

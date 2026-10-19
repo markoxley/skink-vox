@@ -1,0 +1,612 @@
+// File:    summarize.skink
+// Purpose: Text statistics — a port of the reference implementation's
+//          summarize package: readability scores, keyword extraction, and
+//          TL;DR paragraph ranking over punkt-segmented, word-boundary-
+//          tokenized text.
+//
+//          The syllable counter's regexes run on the mini engine (the POSIX
+//          engine lacks the constructs they: use).
+module summarize
+
+import "internal/cornerdata"
+import "internal/easydata"
+import "internal/mathutil"
+import "internal/mini"
+import "internal/stopdata"
+import "internal/strutil"
+import "internal/unicode"
+import "segment"
+import "tokenize"
+import "std/hashmap"
+import "std/math"
+import "std/str"
+
+// Word represents a single word in a Document.
+pub struct Word {
+    Text:      string // the actual text
+    Syllables: int    // the number of syllables
+}
+
+// Sentence represents a single sentence in a Document.
+pub struct Sentence {
+    Text:      string // the actual text
+    Length:    int    // the number of words
+    Words:     []Word // the words in this sentence
+    Paragraph: int
+}
+
+// RankedParagraph is a paragraph ranked by its number of keywords.
+pub struct RankedParagraph {
+    Sentences: []Sentence
+    Position:  int // the zero-based position within a Document
+    Rank:      int
+}
+
+// Document represents a collection of text to be analyzed.
+pub struct Document {
+    Content:         string         // Actual text
+    NumCharacters:   float          // Number of Characters
+    NumComplexWords: float          // PolysylWords without common suffixes
+    NumParagraphs:   float          // Number of paragraphs
+    NumPolysylWords: float          // Number of words with > 2 syllables
+    NumSentences:    float          // Number of sentences
+    NumSyllables:    float          // Number of syllables
+    NumWords:        float          // Number of words
+    NumLongWords:    float          // Number of long words
+    Sentences:       []Sentence     // the Document's sentences
+    WordFrequency:   map[string]int // [word]frequency
+
+    // Initialize calculates the data necessary for computing readability and
+    // usage statistics.
+    pub fn Initialize(d: *Document) {
+        if !sentTokInit {
+            sentTokInit = true
+            s, _ := segment.New()
+            sentenceTokenizer = s
+        }
+        if !wordTokInit {
+            wordTokInit = true
+            wordTokenizer = tokenize.NewWordBoundaryTokenizer()
+        }
+
+        d.WordFrequency = make(map[string]int)
+        paragraphs := str.Split(d.Content, "\n\n")
+        for i := 0; i < len(paragraphs); i = i + 1 {
+            sents := sentenceTokenizer.SegmentText(paragraphs[i])
+            for j := 0; j < len(sents); j = j + 1 {
+                s := sents[j]
+                wordCount := d.NumWords
+                d.NumSentences = d.NumSentences + 1
+                var words []Word
+                toks := wordTokenizer.Tokenize(s)
+                for k := 0; k < len(toks); k = k + 1 {
+                    word := unicodeTrimSpace(toks[k])
+                    if str.Len(word) == 0 {
+                        continue
+                    }
+                    d.NumCharacters = d.NumCharacters + countChars(word)
+                    d.WordFrequency[word] = d.WordFrequency[word] + 1
+                    if str.Len(word) > 6 {
+                        d.NumLongWords = d.NumLongWords + 1
+                    }
+                    syl := Syllables(word)
+                    words = append(words, Word{Text: word, Syllables: syl})
+                    d.NumSyllables = d.NumSyllables + float(syl)
+                    if syl > 2 {
+                        d.NumPolysylWords = d.NumPolysylWords + 1
+                    }
+                    if isComplex(word, syl) {
+                        d.NumComplexWords = d.NumComplexWords + 1
+                    }
+                    d.NumWords = d.NumWords + 1
+                }
+                d.Sentences = append(d.Sentences, Sentence{
+                    Text:      unicodeTrimSpace(s),
+                    Length:    int(d.NumWords - wordCount),
+                    Words:     words,
+                    Paragraph: i,
+                })
+            }
+            d.NumParagraphs = d.NumParagraphs + 1
+        }
+    }
+
+    // Assess returns an Assessment for the Document d.
+    pub fn Assess(d: *Document) -> Assessment {
+        a := Assessment{
+            FleschKincaid:        d.FleschKincaid(),
+            ReadingEase:         d.FleschReadingEase(),
+            GunningFog:          d.GunningFog(),
+            SMOG:                d.SMOG(),
+            DaleChall:           d.DaleChall(),
+            AutomatedReadability: d.AutomatedReadability(),
+            ColemanLiau:         d.ColemanLiau(),
+            LIX:                 d.LIX(),
+        }
+
+        gradeScores := []float{
+            a.FleschKincaid, a.AutomatedReadability, a.GunningFog, a.SMOG,
+            a.ColemanLiau,
+        }
+
+        mean := mathutil.Mean(gradeScores)
+        stdDev := mathutil.StdDev(gradeScores)
+        if mathutil.IsNaN(mean) || mathutil.IsNaN(stdDev) {
+            a.MeanGradeLevel = 0.0
+            a.StdDevGradeLevel = 0.0
+        } else {
+            a.MeanGradeLevel = mean
+            a.StdDevGradeLevel = stdDev
+        }
+
+        return a
+    }
+
+    // Summary returns a Document's n highest ranked paragraphs according to
+    // keyword frequency.
+    pub fn Summary(d: *Document, n: int) -> []RankedParagraph {
+        var rankings []RankedParagraph
+        scores := d.Keywords()
+        for i := 0; i < int(d.NumParagraphs); i = i + 1 {
+            p := RankedParagraph{Position: i}
+            rank := 0
+            size := 0
+            for j := 0; j < len(d.Sentences); j = j + 1 {
+                s := d.Sentences[j]
+                if s.Paragraph == i {
+                    size = size + s.Length
+                    for k := 0; k < len(s.Words); k = k + 1 {
+                        w := s.Words[k]
+                        score, found := scores[w.Text]
+                        if found {
+                            rank = rank + score
+                        }
+                    }
+                    p.Sentences = append(p.Sentences, s)
+                }
+            }
+            // Favor longer paragraphs, as they tend to be more informational.
+            p.Rank = rank * size
+            rankings = append(rankings, p)
+        }
+
+        // Sort by rank.
+        sortByRank(rankings)
+
+        // Take the top-n paragraphs.
+        size := len(rankings)
+        if size > n {
+            var top []RankedParagraph
+            for i := size - n; i < size; i = i + 1 {
+                top = append(top, rankings[i])
+            }
+            rankings = top
+        }
+
+        // Sort by chronological position.
+        sortByIndex(rankings)
+        return rankings
+    }
+
+    // FleschKincaid computes the Flesch–Kincaid grade level.
+    pub fn FleschKincaid(d: *Document) -> float {
+        x := 0.39 * d.NumWords / d.NumSentences
+        y := 11.8 * d.NumSyllables / d.NumWords
+        return x + y - 15.59
+    }
+
+    // FleschReadingEase computes the Flesch reading-ease score.
+    pub fn FleschReadingEase(d: *Document) -> float {
+        x := 1.015 * d.NumWords / d.NumSentences
+        y := 84.6 * d.NumSyllables / d.NumWords
+        return 206.835 - x - y
+    }
+
+    // GunningFog computes the Gunning Fog index score.
+    pub fn GunningFog(d: *Document) -> float {
+        x := d.NumWords / d.NumSentences
+        y := d.NumComplexWords / d.NumWords
+        return 0.4 * (x + 100.0 * y)
+    }
+
+    // LIX computes the LIX readability measure.
+    pub fn LIX(d: *Document) -> float {
+        return (d.NumWords / d.NumSentences) + ((d.NumLongWords * 100.0) / d.NumWords)
+    }
+
+    // SMOG computes the SMOG grade.
+    pub fn SMOG(d: *Document) -> float {
+        return 1.0430 * math.Sqrt(d.NumPolysylWords * 30.0 / d.NumSentences) + 3.1291
+    }
+
+    // AutomatedReadability computes the automated readability index score.
+    pub fn AutomatedReadability(d: *Document) -> float {
+        x := 4.71 * (d.NumCharacters / d.NumWords)
+        y := 0.5 * (d.NumWords / d.NumSentences)
+        return x + y - 21.43
+    }
+
+    // ColemanLiau computes the Coleman–Liau index score.
+    pub fn ColemanLiau(d: *Document) -> float {
+        x := 0.0588 * (d.NumCharacters / d.NumWords) * 100.0
+        y := 0.296 * (d.NumSentences / d.NumWords) * 100.0
+        return x - y - 15.8
+    }
+
+    // DaleChall computes the Dale–Chall score.
+    pub fn DaleChall(d: *Document) -> float {
+        easy := 0.0
+        easySet := easyWordSet()
+        for word := range d.WordFrequency {
+            if easySet.Has(word) {
+                easy = easy + 1.0
+            }
+        }
+        hard := d.NumWords - easy
+        x := (hard / d.NumWords) * 100.0
+        y := d.NumWords / d.NumSentences
+        return 0.1579 * x + 0.0496 * y
+    }
+
+    // WordDensity returns a map of each word and its density.
+    pub fn WordDensity(d: *Document) -> map[string]float {
+        density := make(map[string]float)
+        for word := range d.WordFrequency {
+            density[word] = mathutil.Round(float(d.WordFrequency[word]) / d.NumWords, 3)
+        }
+        return density
+    }
+
+    // Keywords returns a Document's words as map[word]count, omitting stop
+    // words and normalizing case.
+    pub fn Keywords(d: *Document) -> map[string]int {
+        scores := make(map[string]int)
+        stops := stopWordSet()
+        for word := range d.WordFrequency {
+            normalized := unicode.ToLowerStr(word)
+            if stops.Has(normalized) {
+                continue
+            }
+            scores[normalized] = scores[normalized] + d.WordFrequency[word]
+        }
+        return scores
+    }
+
+    // MeanWordLength returns the mean number of characters per word.
+    pub fn MeanWordLength(d: *Document) -> float {
+        return mathutil.Round(d.NumCharacters / d.NumWords, 3)
+    }
+}
+
+// Assessment provides comprehensive access to a Document's metrics.
+pub struct Assessment {
+    // assessments returning an estimated grade level
+    AutomatedReadability: float
+    ColemanLiau:          float
+    FleschKincaid:        float
+    GunningFog:           float
+    SMOG:                 float
+    LIX:                  float
+
+    // mean & standard deviation of the above estimated grade levels
+    MeanGradeLevel:   float
+    StdDevGradeLevel: float
+
+    // assessments returning non-grade numerical scores
+    DaleChall:   float
+    ReadingEase: float
+}
+
+var sentenceTokenizer segment.Segmenter
+var sentTokInit = false
+var wordTokenizer tokenize.WordBoundaryTokenizer
+var wordTokInit = false
+
+// NewDocument is a Document constructor that takes a string and calculates
+// the data necessary for readability and usage statistics.
+pub fn NewDocument(text: string) -> Document {
+    doc := Document{Content: text}
+    doc.Initialize()
+    return doc
+}
+
+// unicodeTrimSpace trims Unicode whitespace from both ends.
+fn unicodeTrimSpace(s: string) -> string {
+    n := str.Len(s)
+    start := 0
+    for start < n {
+        r, size := unicode.DecodeRune(s, start)
+        if size < 1 || !unicode.IsSpace(r) {
+            break
+        }
+        start = start + size
+    }
+    end := n
+    for end > start {
+        r, size := unicode.DecodeLastRune(s, end)
+        if size < 1 || !unicode.IsSpace(r) {
+            break
+        }
+        end = end - size
+    }
+    return str.Substr(s, start, end - start)
+}
+
+// isComplex reports whether a word counts as complex: more than two
+// syllables, ignoring common suffixes.
+fn isComplex(word: string, syllables: int) -> bool {
+    if strutil.HasAnySuffix(word, []string{"es", "ed", "ing"}) {
+        syllables = syllables - 1
+    }
+    return syllables > 2
+}
+
+// countChars counts the letters and numbers in word.
+fn countChars(word: string) -> float {
+    count := 0
+    n := str.Len(word)
+    i := 0
+    for i < n {
+        r, size := unicode.DecodeRune(word, i)
+        if size < 1 {
+            size = 1
+        }
+        if unicode.IsLetter(r) || unicode.IsNumber(r) {
+            count = count + 1
+        }
+        i = i + size
+    }
+    return float(count)
+}
+
+// sortByRank orders paragraphs by ascending rank. The generic sort only
+// accepts pointer-sized elements, so a plain insertion sort is used — the
+// reference uses an unstable sort; this one is stable, which only differs
+// when ranks tie.
+fn sortByRank(rs: []RankedParagraph) {
+    for i := 1; i < len(rs); i = i + 1 {
+        v := rs[i]
+        j := i - 1
+        for j >= 0 && rs[j].Rank > v.Rank {
+            rs[j + 1] = rs[j]
+            j = j - 1
+        }
+        rs[j + 1] = v
+    }
+}
+
+// sortByIndex orders paragraphs by ascending position.
+fn sortByIndex(rs: []RankedParagraph) {
+    for i := 1; i < len(rs); i = i + 1 {
+        v := rs[i]
+        j := i - 1
+        for j >= 0 && rs[j].Position > v.Position {
+            rs[j + 1] = rs[j]
+            j = j - 1
+        }
+        rs[j + 1] = v
+    }
+}
+
+// ============================================================================
+// Readability scores
+// ============================================================================
+
+// ============================================================================
+// Usage statistics
+// ============================================================================
+
+// --- word sets (built lazily from the generated: lists) -------------------------
+
+var easySet hashmap.HashMap<string, int>
+var easySetInit = false
+var stopSet hashmap.HashMap<string, int>
+var stopSetInit = false
+
+fn easyWordSet() -> *hashmap.HashMap<string, int> {
+    if !easySetInit {
+        easySetInit = true
+        easySet = hashmap.New<string, int>()
+        for i := 0; i < len(easydata.Words); i = i + 1 {
+            easySet.Put(easydata.Words[i], 1)
+        }
+    }
+    return &easySet
+}
+
+fn stopWordSet() -> *hashmap.HashMap<string, int> {
+    if !stopSetInit {
+        stopSetInit = true
+        stopSet = hashmap.New<string, int>()
+        for i := 0; i < len(stopdata.Words); i = i + 1 {
+            stopSet.Put(stopdata.Words[i], 1)
+        }
+    }
+    return &stopSet
+}
+
+// ============================================================================
+// Syllables
+// ============================================================================
+
+var cornerMap map[string]int
+var cornerInit = false
+
+fn cornerCases() -> map[string]int {
+    if !cornerInit {
+        cornerInit = true
+        cornerMap = make(map[string]int)
+        for i := 0; i < len(cornerdata.Words); i = i + 1 {
+            cornerMap[cornerdata.Words[i]] = cornerdata.Counts[i]
+        }
+    }
+    return cornerMap
+}
+
+// syllable regexes, compiled lazily.
+var patVowels mini.Pattern
+var patMono1 mini.Pattern
+var patMono2 mini.Pattern
+var patDouble1 mini.Pattern
+var patDouble2 mini.Pattern
+var patDouble3 mini.Pattern
+var patDouble4 mini.Pattern
+var patsInit = false
+
+fn ensurePats() {
+    if patsInit {
+        return
+    }
+    patsInit = true
+    // NOTE: multi-value assignment to package-level vars is silently dropped
+    // by the compiler, so compile into locals first, then assign.
+    pv, _ := mini.New("[aeiouy]+")
+    patVowels = pv
+    pm1, _ := mini.New("cia(l|$)|" +
+        "tia|" +
+        "cius|" +
+        "cious|" +
+        "[^aeiou]giu|" +
+        "[aeiouy][^aeiouy]ion|" +
+        "iou|" +
+        "sia$|" +
+        "eous$|" +
+        "[oa]gue$|" +
+        ".[^aeiuoycgltdb]{2,}ed$|" +
+        ".ely$|" +
+        "^jua|" +
+        "uai|" +
+        "eau|" +
+        "^busi$|" +
+        "([aeiouy](b|c|ch|dg|f|g|gh|gn|k|l|lch|ll|lv|m|mm|n|nc|ng|nch|nn|p|r|rc|rn|rs|rv|s|sc|sk|sl|squ|ss|th|v|y|z)ed$)|" +
+        "([aeiouy](b|ch|d|f|gh|gn|k|l|lch|ll|lv|m|mm|n|nch|nn|p|r|rn|rs|rv|s|sc|sk|sl|squ|ss|st|t|th|v|y)es$)")
+    patMono1 = pm1
+    pm2, _ := mini.New("[aeiouy]" +
+        "(b|c|ch|d|dg|f|g|gh|gn|k|l|ll|lv|m|mm|n|nc|ng|nn|p|r|rc|rn|rs|rv|s|sc|sk|sl|squ|ss|st|t|th|v|y|z)e$")
+    patMono2 = pm2
+    pd1, _ := mini.New("(?:[^aeiouy]ie(r|st|t)|[aeiouym]bl|eo|ism|asm|thm|dnt|uity|dea|gean|oa|ua|eings?|[aeiouy]sh?e[rsd])$")
+    patDouble1 = pd1
+    // NOTE: "{3}" is written out as three class copies because "{3}" inside a
+    // string literal interpolates the expression "3".
+    pd2, _ := mini.New("[^gq]ua[^auieo]|[aeiou][aeiou][aeiou]|^(ia|mc|coa[dglx].)")
+    patDouble2 = pd2
+    pd3, _ := mini.New("[^aeiou]y[ae]|[^l]lien|riet|dien|iu|io|ii|uen|real|iell|eo[^aeiou]|[aeiou]y[aeiou]")
+    patDouble3 = pd3
+    pd4, _ := mini.New("[^s]ia")
+    patDouble4 = pd4
+}
+
+// Syllables returns the number of syllables in the string word.
+//
+// NOTE: This function expects a word (not raw: text) as input.
+pub fn Syllables(word: string) -> int {
+    ensurePats()
+
+    // See if we can leave early.
+    length := unicode.RuneCount(word)
+    if length < 1 {
+        return 0
+    }
+    if length < 3 {
+        return 1
+    }
+
+    // See if this is a known cornercase.
+    word = unicode.ToLowerStr(word)
+    cc := cornerCases()
+    syl, ok := cc[word]
+    if ok {
+        return syl
+    }
+    text, count := clean(word)
+
+    // Count multiple vowels.
+    count = count + len(mini.FindAll(&patVowels, text))
+
+    count = count - len(mini.FindAll(&patMono1, text))
+    count = count - len(mini.FindAll(&patMono2, text))
+
+    count = count + len(mini.FindAll(&patDouble1, text))
+    count = count + len(mini.FindAll(&patDouble2, text))
+    count = count + len(mini.FindAll(&patDouble3, text))
+    count = count + len(mini.FindAll(&patDouble4, text))
+
+    if count < 1 {
+        return 1
+    }
+    return count
+}
+
+// clean strips counting prefixes/suffixes, returning the remainder plus the
+// extra syllables they contribute.
+fn clean(word: string) -> (string, int) {
+    w, prefix := clearPart(word, incrementToPrefix(), true)
+    w2, suffix := clearPart(w, incrementToSuffix(), false)
+    return w2, prefix + suffix
+}
+
+// clearPart applies the first group that trims the word, crediting its
+// position-based syllable count.
+fn clearPart(s: string, options: [][]string, isPrefix: bool) -> (string, int) {
+    old := s
+    pos := len(options)
+    for i := 0; i < len(options); i = i + 1 {
+        if isPrefix {
+            s = trimAnyPrefix(s, options[i])
+        } else {
+            s = trimAnySuffix(s, options[i])
+        }
+        if s != old {
+            return s, pos - i
+        }
+    }
+    return s, 0
+}
+
+// trimAnySuffix removes the first matching suffix.
+fn trimAnySuffix(word: string, suffixes: []string) -> string {
+    for i := 0; i < len(suffixes); i = i + 1 {
+        if str.EndsWith(word, suffixes[i]) {
+            return str.Substr(word, 0, str.Len(word) - str.Len(suffixes[i]))
+        }
+    }
+    return word
+}
+
+// trimAnyPrefix removes the first matching prefix.
+fn trimAnyPrefix(word: string, prefixes: []string) -> string {
+    for i := 0; i < len(prefixes); i = i + 1 {
+        if str.StartsWith(word, prefixes[i]) {
+            return str.Substr(word, str.Len(prefixes[i]), str.Len(word) - str.Len(prefixes[i]))
+        }
+    }
+    return word
+}
+
+// incrementToPrefix lists the prefix groups whose removal adds syllables.
+fn incrementToPrefix() -> [][]string {
+    return [][]string{
+        []string{
+            "above", "anti", "ante", "counter", "hyper", "afore", "agri", "infra",
+            "intra", "inter", "over", "semi", "ultra", "under", "extra", "dia",
+            "micro", "mega", "kilo", "pico", "nano", "macro",
+        },
+        []string{
+            "un", "fore", "ware", "none", "non", "out", "post", "sub", "pre",
+            "pro", "dis", "side",
+        },
+    }
+}
+
+// incrementToSuffix lists the suffix groups whose removal adds syllables.
+fn incrementToSuffix() -> [][]string {
+    return [][]string{
+        []string{"ology", "ologist", "onomy", "onomist"},
+        []string{"fully", "berry", "woman", "women"},
+        []string{
+            "ly", "less", "some", "ful", "er", "ers", "ness", "cian", "cians",
+            "ment", "ments", "ette", "ettes", "ville", "villes", "ships", "ship",
+            "side", "sides", "port", "ports", "shire", "shires", "tion", "tioned",
+        },
+    }
+}

@@ -1,0 +1,793 @@
+// File:    internal/punkt.skink
+// Purpose: The Punkt unsupervised sentence-boundary detector, ported from
+//          the sentences library (v1.0.6) plus prose's customizations: the
+//          custom word tokenizer's extended ender set, the multi-punctuation
+//          abbreviation annotation, and the supervised abbreviation list.
+//
+//          Training data lives in a JSON model file (see segment.skink for
+//          loading); the pipeline is:
+//
+//              word tokens -> type annotations -> pair annotations
+//              -> prose's multi-punct annotation -> SentBreak flags
+//              -> sentence spans
+//
+//          All regular expressions in the original are fixed patterns and
+//          are reimplemented here as scanners.
+module punkt
+
+import "internal/unicode"
+import "std/errors"
+import "std/hashmap"
+import "std/json"
+import "std/str"
+
+// --- Token -------------------------------------------------------------------
+
+// PunktToken stores a token of text with annotations produced during
+// sentence boundary detection.
+pub struct PunktToken {
+    Tok:       string
+    Position:  int  // byte offset just past the token in the source
+    SentBreak: bool
+    ParaStart: bool
+    LineStart: bool
+    Abbr:      bool
+}
+
+// NewPunktToken creates a token for the given word.
+pub fn NewPunktToken(word: string) -> PunktToken {
+    return PunktToken{Tok: word}
+}
+
+// --- punctuation helpers ------------------------------------------------------
+
+// Punctuation characters that can end a sentence.
+pub fn Punctuation() -> string {
+    return ";:,.!?"
+}
+
+// HasSentencePunct reports whether text contains ., !, or ?.
+pub fn HasSentencePunct(text: string) -> bool {
+    n := str.Len(text)
+    for i := 0; i < n; i = i + 1 {
+        c := text[i]
+        if c == 46 || c == 33 || c == 63 {
+            return true
+        }
+    }
+    return false
+}
+
+// isWordASCII reports whether b is a regexp \w byte: [0-9A-Za-z_].
+fn isWordASCII(b: int) -> bool {
+    return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) ||
+        (b >= 97 && b <= 122) || b == 95
+}
+
+// isSpaceRe reports whether b is a regexp \s byte: [\t\n\f\r ].
+fn isSpaceRe(b: int) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 12 || b == 13
+}
+
+// isDigitByte reports whether b is an ASCII digit.
+fn isDigitByte(b: int) -> bool {
+    return b >= 48 && b <= 57
+}
+
+// --- regex equivalents (all fixed: patterns, implemented as: scanners) ----------
+
+// reEllipsis matches \.\.+$ — true when s ends with two or more periods.
+fn isEllipsisTok(s: string) -> bool {
+    n := str.Len(s)
+    if n < 2 || s[n - 1] != 46 || s[n - 2] != 46 {
+        return false
+    }
+    return true
+}
+
+// reNumeric replaces `-?[\.,]?\d[\d,\.-]*\.?$` with "##number##".
+//
+// The pattern is end-anchored: a match is a suffix of the form optional '-',
+// optional ',' or '.', a digit, then digits/commas/periods/hyphens to the
+// end. The leftmost start wins, matching the regexp engine.
+fn numericType(typ: string) -> string {
+    n := str.Len(typ)
+    i := 0
+    for i < n {
+        j := i
+        if typ[j] == 45 { // '-'
+            j = j + 1
+        }
+        if j < n && (typ[j] == 44 || typ[j] == 46) { // ',' or '.'
+            j = j + 1
+        }
+        if j < n && isDigitByte(typ[j]) {
+            ok := true
+            for k := j + 1; k < n; k = k + 1 {
+                c := typ[k]
+                if !(isDigitByte(c) || c == 44 || c == 46 || c == 45) {
+                    ok = false
+                    break
+                }
+            }
+            if ok {
+                return str.Concat(str.Substr(typ, 0, i), "##number##")
+            }
+        }
+        i = i + 1
+    }
+    return typ
+}
+
+// reInitial matches ^[A-Za-z]\.$ — a single letter followed by a period.
+fn isInitialTok(s: string) -> bool {
+    n := str.Len(s)
+    if n != 2 || s[1] != 46 {
+        return false
+    }
+    c := s[0]
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+// reAlpha matches ^[A-Za-z]+$ — all ASCII letters.
+fn isAlphaTok(s: string) -> bool {
+    n := str.Len(s)
+    if n == 0 {
+        return false
+    }
+    for i := 0; i < n; i = i + 1 {
+        c := s[i]
+        if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+            return false
+        }
+    }
+    return true
+}
+
+// isNonPunct implements `[^\W\d]` as a contains-match on the type string —
+// true when the type contains at least one ASCII letter or underscore.
+fn isNonPunctType(typ: string) -> bool {
+    n := str.Len(typ)
+    for i := 0; i < n; i = i + 1 {
+        c := typ[i]
+        if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 {
+            return true
+        }
+    }
+    return false
+}
+
+// reAbbr contains-check for `((?:[\w]\.)+[\w]*\.)` — a word char, a dot, then
+// either more pairs or word chars ending in a dot.
+fn containsAbbr(s: string) -> bool {
+    n := str.Len(s)
+    for i := 0; i + 1 < n; i = i + 1 {
+        if !isWordASCII(s[i]) || s[i + 1] != 46 {
+            continue
+        }
+        k := i + 2
+        for k < n && isWordASCII(s[k]) {
+            k = k + 1
+        }
+        if k < n && s[k] == 46 {
+            return true
+        }
+    }
+    return false
+}
+
+// reLooksLikeEllipsis contains-check for `(?:\.\s?){2,}\.` — at least three
+// dots separated by at most one whitespace byte each.
+fn looksLikeEllipsis(s: string) -> bool {
+    n := str.Len(s)
+    for i := 0; i < n; i = i + 1 {
+        if s[i] != 46 {
+            continue
+        }
+        dots := 1
+        j := i + 1
+        for j < n {
+            k := j
+            if s[k] != 46 && isSpaceRe(s[k]) {
+                k = k + 1
+            }
+            if k < n && s[k] == 46 {
+                dots = dots + 1
+                j = k + 1
+                continue
+            }
+            break
+        }
+        if dots >= 3 {
+            return true
+        }
+        // Skip past this run's first dot only — later dots may start a
+        // longer run of their own.
+    }
+    return false
+}
+
+// --- Storage -----------------------------------------------------------------
+
+// Storage holds the trained data used for sentence boundary detection.
+pub struct Storage {
+    AbbrevTypes:  hashmap.HashMap<string, int>
+    Collocations: hashmap.HashMap<string, int>
+    SentStarters: hashmap.HashMap<string, int>
+    OrthoContext: hashmap.HashMap<string, int>
+}
+
+// NewStorage creates an empty storage container.
+pub fn NewStorage() -> Storage {
+    return Storage{
+        AbbrevTypes:  hashmap.New<string, int>(),
+        Collocations: hashmap.New<string, int>(),
+        SentStarters: hashmap.New<string, int>(),
+        OrthoContext: hashmap.New<string, int>(),
+    }
+}
+
+// IsAbbr determines if any of the tokens are abbreviations.
+pub fn IsAbbr(s: *Storage, tokNoPeriod: string, lastHyph: string) -> bool {
+    return s.AbbrevTypes.Has(tokNoPeriod) || s.AbbrevTypes.Has(lastHyph)
+}
+
+// setHas mirrors the reference's map[string]int membership check.
+fn setHas(s: hashmap.HashMap<string, int>, key: string) -> bool {
+    v, err := s.Get(key)
+    if err.message != "" {
+        return false
+    }
+    return v != 0
+}
+
+// orthoCtx returns the orthographic context flags for a word type.
+fn orthoCtx(s: *Storage, typ: string) -> int {
+    v, err := s.OrthoContext.Get(typ)
+    if err.message != "" {
+        return 0
+    }
+    return v
+}
+
+// --- word tokenizer ------------------------------------------------------------
+
+// WordTokenizer breaks text into word tokens, tracking positions, line
+// starts, and paragraph starts. When onlyPeriodContext is set, only tokens
+// containing sentence punctuation — and the token after each of those — are
+// returned.
+pub fn WordTokenize(text: string, onlyPeriodContext: bool) -> []PunktToken {
+    var tokens []PunktToken
+    textLength := str.Len(text)
+    if textLength == 0 {
+        return tokens
+    }
+
+    lastSpace := 0
+    lineStart := false
+    paragraphStart := false
+    getNextWord := false
+
+    i := 0
+    for i < textLength {
+        char, size := unicode.DecodeRune(text, i)
+        if size < 1 {
+            size = 1
+        }
+        // NOTE: the reference tests `i != textLength-1` — the byte index of
+        // the rune's start, not whether it is the last rune. A multi-byte
+        // final rune is therefore never treated as the end of input; this
+        // mirrors that exactly.
+        if !unicode.IsSpace(char) && i != textLength - 1 {
+            i = i + size
+            continue
+        }
+
+        if char == 10 {
+            if lineStart {
+                paragraphStart = true
+            }
+            lineStart = true
+        }
+
+        cursor := i
+        if i == textLength - 1 {
+            cursor = textLength
+        }
+
+        word := trimSpace(str.Substr(text, lastSpace, cursor - lastSpace))
+        if word == "" {
+            i = i + size
+            continue
+        }
+
+        hasSentPunct := HasSentencePunct(word)
+        if onlyPeriodContext && !hasSentPunct && !getNextWord {
+            lastSpace = cursor
+            i = i + size
+            continue
+        }
+
+        tok := NewPunktToken(word)
+        tok.Position = cursor
+        tok.ParaStart = paragraphStart
+        tok.LineStart = lineStart
+        tokens = append(tokens, tok)
+
+        lastSpace = cursor
+        lineStart = false
+        paragraphStart = false
+
+        if hasSentPunct {
+            getNextWord = true
+        } else {
+            getNextWord = false
+        }
+        i = i + size
+    }
+
+    if len(tokens) == 0 {
+        tok := NewPunktToken(text)
+        tok.Position = textLength
+        tokens = append(tokens, tok)
+    }
+
+    return tokens
+}
+
+// trimSpace trims Unicode whitespace — the reference uses TrimSpace here,
+// which is Unicode-aware.
+fn trimSpace(s: string) -> string {
+    start := 0
+    n := str.Len(s)
+    for start < n {
+        r, size := unicode.DecodeRune(s, start)
+        if size < 1 || !unicode.IsSpace(r) {
+            break
+        }
+        start = start + size
+    }
+    end := n
+    for end > start {
+        r, size := unicode.DecodeLastRune(s, end)
+        if size < 1 || !unicode.IsSpace(r) {
+            break
+        }
+        end = end - size
+    }
+    return str.Substr(s, start, end - start)
+}
+
+// --- token type helpers -------------------------------------------------------
+
+// Type returns a case-normalized representation of the token.
+pub fn Type(t: PunktToken) -> string {
+    typ := numericType(unicode.ToLowerStr(t.Tok))
+    if str.Len(typ) == 1 {
+        return typ
+    }
+    // Remove commas.
+    return str.Replace(typ, ",", "")
+}
+
+// TypeNoPeriod is the type with its final period removed if it has one.
+pub fn TypeNoPeriod(t: PunktToken) -> string {
+    typ := Type(t)
+    if str.Len(typ) > 1 && typ[str.Len(typ) - 1] == 46 {
+        return str.Substr(typ, 0, str.Len(typ) - 1)
+    }
+    return typ
+}
+
+// TypeNoSentPeriod is the type with its final period removed if the token is
+// marked as a sentence break.
+pub fn TypeNoSentPeriod(t: PunktToken) -> string {
+    if t.SentBreak {
+        return TypeNoPeriod(t)
+    }
+    return Type(t)
+}
+
+// FirstUpper is true if the token's first character is uppercase.
+pub fn FirstUpper(t: PunktToken) -> bool {
+    if str.Len(t.Tok) == 0 {
+        return false
+    }
+    r, _ := unicode.DecodeRune(t.Tok, 0)
+    return unicode.IsUpper(r)
+}
+
+// FirstLower is true if the token's first character is lowercase.
+pub fn FirstLower(t: PunktToken) -> bool {
+    if str.Len(t.Tok) == 0 {
+        return false
+    }
+    r, _ := unicode.DecodeRune(t.Tok, 0)
+    return unicode.IsLower(r)
+}
+
+// IsEllipsis is true if the token text is that of an ellipsis.
+pub fn IsEllipsis(t: PunktToken) -> bool {
+    return isEllipsisTok(t.Tok)
+}
+
+// IsNumber is true if the token text is that of a number.
+pub fn IsNumber(t: PunktToken) -> bool {
+    return str.StartsWith(t.Tok, "##number##")
+}
+
+// IsInitial is true if the token text is that of an initial.
+pub fn IsInitial(t: PunktToken) -> bool {
+    return isInitialTok(t.Tok)
+}
+
+// IsAlpha is true if the token text is all alphabetic.
+pub fn IsAlpha(t: PunktToken) -> bool {
+    return isAlphaTok(t.Tok)
+}
+
+// IsNonPunct is true if the token is either a number or is alphabetic.
+pub fn IsNonPunct(t: PunktToken) -> bool {
+    return isNonPunctType(Type(t))
+}
+
+// HasPeriodFinal is true if the last byte of the token is a period.
+pub fn HasPeriodFinal(t: PunktToken) -> bool {
+    return str.EndsWith(t.Tok, ".")
+}
+
+// HasSentEndChars finds any punctuation excluding the period final — prose's
+// extended ender set, including curly quotes and the "Yahoo!" exception.
+pub fn HasSentEndChars(t: PunktToken) -> bool {
+    enders := []string{
+        ".\"", ".)", ".’", ".”",
+        "?", "?\"", "?'", "?)", "?’", "?”",
+        "!", "!\"", "!'", "!)", "!’", "!”",
+    }
+    for i := 0; i < len(enders); i = i + 1 {
+        if str.EndsWith(t.Tok, enders[i]) && !str.Contains(t.Tok, "Yahoo!") {
+            return true
+        }
+    }
+
+    parens := []string{
+        ".[", ".(", ".\"",
+        "?[", "?(",
+        "![", "!(",
+    }
+    for i := 0; i < len(parens); i = i + 1 {
+        if str.Contains(t.Tok, parens[i]) {
+            return true
+        }
+    }
+    return false
+}
+
+// looksInternal determines if tok's punctuation could appear
+// sentence-internally (i.e., parentheses or: quotations).
+fn looksInternal(tok: string) -> bool {
+    internal := []string{")", "’", "”", "\"", "'"}
+    for i := 0; i < len(internal); i = i + 1 {
+        if str.EndsWith(tok, internal[i]) {
+            return true
+        }
+    }
+    return false
+}
+
+// --- orthographic context -------------------------------------------------------
+
+// Orthographic context bit flags.
+var orthoBegUc = 2
+var orthoMidUc = 4
+var orthoUnkUc = 8
+var orthoBegLc = 16
+var orthoMidLc = 32
+var orthoUnkLc = 64
+var orthoUc = 14
+var orthoLc = 112
+
+// OrthoHeuristic decides whether the given token is the first token in a
+// sentence: 1 = likely sentence starter, 0 = likely not, -1 = unknown.
+pub fn OrthoHeuristic(s: *Storage, token: PunktToken) -> int {
+    for i := 0; i < str.Len(Punctuation()); i = i + 1 {
+        if str.Len(token.Tok) == 1 && token.Tok[0] == Punctuation()[i] {
+            return 0
+        }
+    }
+
+    ctx := orthoCtx(s, TypeNoSentPeriod(token))
+
+    // If the word is capitalized, occurs at least once with a lower case
+    // first letter, and never occurs with an upper case first letter
+    // sentence-internally, then it's a sentence starter.
+    if FirstUpper(token) && ((ctx & orthoLc) > 0 && (ctx & orthoMidUc) == 0) {
+        return 1
+    }
+
+    // If the word is lower case, and either (a) we've seen it used with
+    // upper case, or (b) we've never seen it used sentence-initially with
+    // lower case, then it's not a sentence starter.
+    if FirstLower(token) && ((ctx & orthoUc) > 0 || (ctx & orthoBegLc) == 0) {
+        return 0
+    }
+
+    return -1
+}
+
+// --- annotations -----------------------------------------------------------------
+
+// typeAnnotation makes decisions based purely on each word's type.
+fn typeAnnotation(s: *Storage, tok: *PunktToken) {
+    runeCount := unicode.RuneCount(tok.Tok)
+
+    if HasSentEndChars(*tok) {
+        tok.SentBreak = true
+    } else if HasPeriodFinal(*tok) && !str.EndsWith(tok.Tok, "..") {
+        // NOTE: mirrors an upstream quirk — the slice bound is the rune
+        // count minus one applied to the byte string.
+        tokNoPeriod := unicode.ToLowerStr(str.Substr(tok.Tok, 0, runeCount - 1))
+        parts := str.Split(tokNoPeriod, "-")
+        tokLastHyphEl := parts[len(parts) - 1]
+
+        if IsAbbr(s, tokNoPeriod, tokLastHyphEl) {
+            tok.Abbr = true
+        } else {
+            tok.SentBreak = true
+        }
+    }
+}
+
+// tokenBasedAnnotation performs the token-based classification over token
+// pairs: the orthographic, collocation, and sentence-starter heuristics.
+fn tokenBasedAnnotation(s: *Storage, tokOne: *PunktToken, tokTwo: *PunktToken, hasTwo: bool) {
+    if !hasTwo {
+        return
+    }
+
+    if !HasPeriodFinal(*tokOne) {
+        return
+    }
+
+    typ := TypeNoPeriod(*tokOne)
+    nextTyp := TypeNoSentPeriod(*tokTwo)
+    tokIsInitial := IsInitial(*tokOne)
+
+    // [4.1.2. Collocation Heuristic] If there's a collocation between the
+    // word before and after the period, then label tok as an abbreviation
+    // and NOT a sentence break.
+    collocation := str.Concat(typ, str.Concat(",", nextTyp))
+    if setHas(s.Collocations, collocation) {
+        tokOne.SentBreak = false
+        tokOne.Abbr = true
+        return
+    }
+
+    // [4.2. Token-Based Reclassification of Abbreviations]
+    if (tokOne.Abbr || IsEllipsis(*tokOne)) && !tokIsInitial {
+        // [4.1.1. Orthographic Heuristic]
+        isSentStarter := OrthoHeuristic(s, *tokTwo)
+        if isSentStarter == 1 {
+            tokOne.SentBreak = true
+            return
+        }
+
+        // [4.1.3. Frequent Sentence Starter Heuristic]
+        if FirstUpper(*tokTwo) && setHas(s.SentStarters, nextTyp) {
+            tokOne.SentBreak = true
+            return
+        }
+    }
+
+    // Two consecutive lone "." tokens are probably a spaced ellipsis.
+    if tokOne.Tok == "." && tokTwo.Tok == "." {
+        tokOne.SentBreak = false
+        tokTwo.SentBreak = false
+        return
+    }
+
+    // [4.3. Token-Based Detection of Initials and Ordinals]
+    if tokIsInitial || typ == "##number##" {
+        isSentStarter := OrthoHeuristic(s, *tokTwo)
+
+        if isSentStarter == 0 {
+            tokOne.SentBreak = false
+            tokOne.Abbr = true
+            return
+        }
+
+        // Special heuristic for initials: if the orthographic heuristic is
+        // unknown, and the next word is always capitalized, then mark as
+        // abbrev (eg: J. Bach).
+        if isSentStarter == -1 &&
+            tokIsInitial &&
+            FirstUpper(*tokTwo) &&
+            (orthoCtx(s, nextTyp) & orthoLc) == 0 {
+            tokOne.SentBreak = false
+            tokOne.Abbr = true
+            return
+        }
+    }
+}
+
+// multiPunctAnnotation is prose's customization pass for abbreviations like
+// "F.B.I.", ellipses, and internal-looking punctuation.
+fn multiPunctAnnotation(s: *Storage, tokOne: *PunktToken, tokTwo: *PunktToken, hasTwo: bool) {
+    if !hasTwo {
+        // A lone trailing token: an errant newline inside it means we
+        // mislabeled the break.
+        if str.Contains(tokOne.Tok, "\n") && str.Contains(tokOne.Tok, " ") {
+            tokOne.SentBreak = false
+        }
+        return
+    }
+
+    var nextTyp string
+
+    // If both tokens end periods, we're probably in an ellipsis that wasn't
+    // properly tokenized.
+    if str.EndsWith(tokOne.Tok, ".") && tokTwo.Tok == "." {
+        tokOne.SentBreak = false
+        tokTwo.SentBreak = false
+        return
+    }
+
+    isNonBreak := str.EndsWith(tokOne.Tok, ".") && !tokOne.SentBreak
+    isEllipsis := looksLikeEllipsis(tokOne.Tok)
+    isInternal := tokOne.SentBreak && looksInternal(tokOne.Tok)
+
+    if isNonBreak || isEllipsis || isInternal {
+        nextTyp = TypeNoSentPeriod(*tokTwo)
+        isStarter := setHas(s.SentStarters, nextTyp)
+
+        if isEllipsis {
+            if FirstUpper(*tokTwo) || isStarter {
+                tokOne.SentBreak = true
+                return
+            }
+        }
+
+        if isInternal {
+            if FirstLower(*tokTwo) && !isStarter {
+                tokOne.SentBreak = false
+                return
+            }
+        }
+
+        if isNonBreak && FirstUpper(*tokTwo) {
+            if (orthoCtx(s, nextTyp) & 112) != 0 {
+                tokOne.SentBreak = true
+            }
+        }
+    }
+
+    if !containsAbbr(tokOne.Tok) {
+        return
+    }
+
+    if IsInitial(*tokOne) {
+        return
+    }
+
+    tokOne.Abbr = true
+    tokOne.SentBreak = false
+
+    // [4.1.1. Orthographic Heuristic]
+    isSentStarter := OrthoHeuristic(s, *tokTwo)
+    if isSentStarter == 1 {
+        tokOne.SentBreak = true
+        return
+    }
+
+    if str.Len(nextTyp) == 0 {
+        nextTyp = TypeNoSentPeriod(*tokTwo)
+    }
+
+    // [4.1.3. Frequent Sentence Starter Heuristic]
+    if FirstUpper(*tokTwo) && setHas(s.SentStarters, nextTyp) {
+        tokOne.SentBreak = true
+        return
+    }
+}
+
+// Annotate runs the three annotation passes over the word tokens, in the
+// same order as the reference pipeline: type-based, token-based, then
+// prose's multi-punctuation pass.
+pub fn Annotate(s: *Storage, tokens: []PunktToken) {
+    for i := 0; i < len(tokens); i = i + 1 {
+        typeAnnotation(s, &tokens[i])
+    }
+    for i := 0; i < len(tokens); i = i + 1 {
+        // Pass the real slice element — writes to tokTwo must land on the
+        // shared token, not a copy.
+        if i + 1 < len(tokens) {
+            tokenBasedAnnotation(s, &tokens[i], &tokens[i + 1], true)
+        } else {
+            tokenBasedAnnotation(s, &tokens[i], &tokens[i], false)
+        }
+    }
+    for i := 0; i < len(tokens); i = i + 1 {
+        if i + 1 < len(tokens) {
+            multiPunctAnnotation(s, &tokens[i], &tokens[i + 1], true)
+        } else {
+            multiPunctAnnotation(s, &tokens[i], &tokens[i], false)
+        }
+    }
+}
+
+// --- sentence tokenizer -----------------------------------------------------------
+
+// PunktSentence is a sentence span in the source text.
+pub struct PunktSentence {
+    Start: int
+    End:   int
+}
+
+// AnnotatedTokens returns the fully annotated word tokens for text.
+pub fn AnnotatedTokens(s: *Storage, text: string) -> []PunktToken {
+    tokens := WordTokenize(text, true)
+    if len(tokens) == 0 {
+        return tokens
+    }
+    Annotate(s, tokens)
+    return tokens
+}
+
+// TokenizeSentences splits text into sentence spans.
+pub fn TokenizeSentences(s: *Storage, text: string) -> []PunktSentence {
+    annotated := AnnotatedTokens(s, text)
+
+    var sentences []PunktSentence
+    lastBreak := 0
+    for i := 0; i < len(annotated); i = i + 1 {
+        if !annotated[i].SentBreak {
+            continue
+        }
+        sentences = append(sentences, PunktSentence{
+            Start: lastBreak,
+            End:   annotated[i].Position,
+        })
+        lastBreak = annotated[i].Position
+    }
+
+    if lastBreak != str.Len(text) {
+        sentences = append(sentences, PunktSentence{
+            Start: lastBreak,
+            End:   str.Len(text),
+        })
+    }
+
+    return sentences
+}
+
+// --- training data ------------------------------------------------------------------
+
+// LoadTraining parses a punkt JSON model file's contents into Storage.
+// The JSON has four objects — AbbrevTypes, Collocations, SentStarters and
+// OrthoContext — each mapping strings to small integers.
+pub fn LoadTraining(data: string) -> (Storage, errors.Error) {
+    s := NewStorage()
+    v, err := json.Unmarshal(data)
+    if err.message != "" {
+        return s, err
+    }
+    loadSet(&s.AbbrevTypes, json.GetObject(v, "AbbrevTypes"))
+    loadSet(&s.Collocations, json.GetObject(v, "Collocations"))
+    loadSet(&s.SentStarters, json.GetObject(v, "SentStarters"))
+    loadSet(&s.OrthoContext, json.GetObject(v, "OrthoContext"))
+    return s, errors.New("")
+}
+
+// loadSet copies a JSON object's string->number entries into a set.
+fn loadSet(dst: *hashmap.HashMap<string, int>, obj: json.Value) {
+    n := json.ObjectLen(obj)
+    for i := 0; i < n; i = i + 1 {
+        key, val := json.ObjectGetByIndex(obj, i)
+        dst.Put(key, int(json.AsNumber(val)))
+    }
+}
+
+// AddAbbrev registers a supervised abbreviation with the model.
+pub fn AddAbbrev(s: *Storage, abbr: string) {
+    s.AbbrevTypes.Put(abbr, 1)
+}

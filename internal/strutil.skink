@@ -1,0 +1,123 @@
+// File:    internal/strutil.skink
+// Purpose: Small string helpers used across the prose port, mirroring the
+//          reference implementation's internal/strutil.
+module strutil
+
+import "internal/unicode"
+import "std/fs"
+import "std/str"
+
+// HasAnySuffix reports whether s ends with any of the suffixes.
+pub fn HasAnySuffix(s: string, suffixes: []string) -> bool {
+    for i := 0; i < len(suffixes); i = i + 1 {
+        if str.EndsWith(s, suffixes[i]) {
+            return true
+        }
+    }
+    return false
+}
+
+// HasAnyPrefix reports whether s begins with any of the prefixes.
+pub fn HasAnyPrefix(s: string, prefixes: []string) -> bool {
+    for i := 0; i < len(prefixes); i = i + 1 {
+        if str.StartsWith(s, prefixes[i]) {
+            return true
+        }
+    }
+    return false
+}
+
+// HasAnyIndex returns the index of the earliest of substrs found in s, or -1.
+pub fn HasAnyIndex(s: string, substrs: []string) -> int {
+    best := -1
+    for i := 0; i < len(substrs); i = i + 1 {
+        j := str.IndexOf(s, substrs[i])
+        if j >= 0 && (best == -1 || j < best) {
+            best = j
+        }
+    }
+    return best
+}
+
+// StringInSlice reports whether slice contains target.
+pub fn StringInSlice(target: string, slice: []string) -> bool {
+    for i := 0; i < len(slice); i = i + 1 {
+        if slice[i] == target {
+            return true
+        }
+    }
+    return false
+}
+
+// CharAt returns the byte at index i, or 0 if out of range.
+pub fn CharAt(s: string, i: int) -> int {
+    if i >= 0 && i < str.Len(s) {
+        return s[i]
+    }
+    return 0
+}
+
+// Min returns the smaller of a and b.
+pub fn Min(a: int, b: int) -> int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// ToTitle uppercases the first rune of m. If strict, the remainder is
+// lowercased.
+pub fn ToTitle(m: string, strict: bool) -> string {
+    if str.Len(m) == 0 {
+        return m
+    }
+    _, size := unicode.DecodeRune(m, 0)
+    other := str.Substr(m, size, str.Len(m) - size)
+    if strict {
+        other = unicode.ToLowerStr(other)
+    }
+    head := unicode.MapRunes(str.Substr(m, 0, size), unicode.ToTitle)
+    return str.Concat(head, other)
+}
+
+// Fields splits s around runs of Unicode whitespace, like the reference's
+// strings.Fields.
+pub fn Fields(s: string) -> []string {
+    var out []string
+    n := str.Len(s)
+    i := 0
+    for i < n {
+        r, size := unicode.DecodeRune(s, i)
+        if size < 1 {
+            size = 1
+        }
+        if unicode.IsSpace(r) {
+            i = i + size
+            continue
+        }
+        j := i
+        for j < n {
+            r2, size2 := unicode.DecodeRune(s, j)
+            if size2 < 1 {
+                size2 = 1
+            }
+            if unicode.IsSpace(r2) {
+                break
+            }
+            j = j + size2
+        }
+        out = append(out, str.Substr(s, i, j - i))
+        i = j
+    }
+    return out
+}
+
+// ReadDataFile reads the whole file at path, returning (content, ok).
+// Test-support only.
+pub fn ReadDataFile(path: string) -> (string, bool) {
+    data, err := fs.ReadAll(path)
+    if err.message != "" {
+        return "", false
+    }
+    return data, true
+}

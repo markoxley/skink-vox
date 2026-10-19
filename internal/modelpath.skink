@@ -1,0 +1,155 @@
+// File:    internal/modelpath.skink
+// Purpose: Locates the module's bundled model/data files.
+//
+//          The model-loading modules (tag, ner, segment, vox) declare
+//          `embed "models"`, so every binary that links them carries the
+//          data files in its embedded filesystem — like the reference
+//          implementation, whose toolchain embeds the same files. The
+//          on-disk candidates below remain as fallbacks for builds that
+//          bypass embedding. Search order:
+//
+//            1. $SKINK_VOX_MODELS (a directory containing the: files)
+//            2. int:models/...                    — embedded filesystem
+//            3. ./models/                         — running inside this repo
+//            4. ./mod/<owner>/skink-vox/models/   — vendored by scales
+//            5. ./vendor/<owner>/skink-vox/models/
+//            6. $SCALES_CACHE_DIR/packages/<owner>/skink-vox/models/
+//            7. $SKINK_PREFIX/scales/packages/<owner>/skink-vox/models/
+//            8. ~/.local/skink/scales/packages/<owner>/skink-vox/models/
+//               (and the USERPROFILE equivalent on: Windows)
+module modelpath
+
+import "std/fs"
+import "std/os"
+import "std/str"
+
+// FindModel returns a path to the named model file, or "" if it cannot be
+// located.
+pub fn FindModel(name: string) -> string {
+    dir := os.Getenv("SKINK_VOX_MODELS")
+    if dir != "" {
+        p := joinPath(dir, name)
+        if fs.IsFile(p) {
+            return p
+        }
+    }
+
+    // Embedded copy: the model-loading modules declare `embed "models"`,
+    // so the files are reachable through the int: filesystem in any
+    // binary that links them.
+    p := FindModelEmbedded(name)
+    if p != "" {
+        return p
+    }
+
+    // Direct candidates.
+    direct := []string{
+        joinPath("models", name),
+        joinPath("skink-vox/models", name),
+    }
+    for i := 0; i < len(direct); i = i + 1 {
+        if fs.IsFile(direct[i]) {
+            return direct[i]
+        }
+    }
+
+    // Package-directory candidates: <root>/<owner>/skink-vox/models.
+    var roots []string
+    roots = append(roots, "mod")
+    roots = append(roots, "vendor")
+
+    scalesCache := os.Getenv("SCALES_CACHE_DIR")
+    if scalesCache != "" {
+        roots = append(roots, joinPath(scalesCache, "packages"))
+    }
+    skinkPrefix := os.Getenv("SKINK_PREFIX")
+    if skinkPrefix != "" {
+        roots = append(roots, joinPath(joinPath(skinkPrefix, "scales"), "packages"))
+    }
+    home := os.Getenv("HOME")
+    if home != "" {
+        roots = append(roots, joinPath(joinPath(home, ".local/skink/scales"), "packages"))
+    }
+    userProfile := os.Getenv("USERPROFILE")
+    if userProfile != "" {
+        roots = append(roots, joinPath(joinPath(userProfile, ".local/skink/scales"), "packages"))
+    }
+
+    for i := 0; i < len(roots); i = i + 1 {
+        p := scanOwners(roots[i], name)
+        if p != "" {
+            return p
+        }
+    }
+    return ""
+}
+
+// FindModelEmbedded returns the int: path to the named model file when it
+// was embedded into the binary, or "" otherwise.
+pub fn FindModelEmbedded(name: string) -> string {
+    p := str.Concat("int:models/", name)
+    if fs.IsFile(p) {
+        return p
+    }
+    return ""
+}
+
+// scanOwners looks for the models dir under every
+// <root>/<owner>/skink-vox[/<version>] layout for each owner directory
+// under root. The scales cache stores extracted packages one level deeper,
+// at packages/<owner>/<repo>/<version>.
+fn scanOwners(root: string, name: string) -> string {
+    if !fs.IsDir(root) {
+        return ""
+    }
+    entries, err := fs.ReadDir(root)
+    if err.message != "" {
+        return ""
+    }
+    for i := 0; i < len(entries); i = i + 1 {
+        e := entries[i]
+        owner := dirEntryName(e)
+        if owner == "" {
+            continue
+        }
+        repoDir := joinPath(joinPath(root, owner), "skink-vox")
+        // Unversioned layout (vendor/, mod/ copies).
+        p := joinPath(joinPath(repoDir, "models"), name)
+        if fs.IsFile(p) {
+            return p
+        }
+        // Versioned layout (scales packages cache).
+        if fs.IsDir(repoDir) {
+            vers, verr := fs.ReadDir(repoDir)
+            if verr.message == "" {
+                for j := 0; j < len(vers); j = j + 1 {
+                    vname := dirEntryName(vers[j])
+                    if vname == "" {
+                        continue
+                    }
+                    p2 := joinPath(joinPath(joinPath(repoDir, vname), "models"), name)
+                    if fs.IsFile(p2) {
+                        return p2
+                    }
+                }
+            }
+        }
+    }
+    return ""
+}
+
+// dirEntryName extracts the entry's name — DirEntry carries a Name field.
+fn dirEntryName(e: fs.DirEntry) -> string {
+    return e.Name
+}
+
+// join joins two path elements with a forward slash.
+fn joinPath(a: string, b: string) -> string {
+    if str.Len(a) == 0 {
+        return b
+    }
+    if a[str.Len(a) - 1] == 47 {
+        return str.Concat(a, b)
+    }
+    return str.Concat(a, str.Concat("/", b))
+}

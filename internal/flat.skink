@@ -1,0 +1,391 @@
+// File:    internal/flat.skink
+// Purpose: Reader for the "flat" averaged-perceptron model format used by the
+//          part-of-speech tagger, ported from the reference implementation's
+//          internal/flat.
+//
+//          # Layout (all little-endian)
+//
+//              magic     [8]byte  "PROSETAG"
+//              version   uint32
+//              nClasses  uint32   then per class: uint16 len + bytes
+//              nFeatures uint32
+//              nPairs    uint32
+//              blobLen   uint32   then blobLen bytes (feature: strings,
+//                                   concatenated, sorted: bytewise)
+//              featOff   (nFeatures+1) x uint32   (slices into the: blob)
+//              pairOff   (nFeatures+1) x uint32   (slices into classIDs/weights)
+//              classIDs  nPairs x uint8
+//              weights   nPairs x float32
+//              nTagMap   uint32   then per entry: uint16 len + bytes,
+//                                   uint8 classID
+//
+//          The model buffer is binary data and may contain NUL bytes, so
+//          none of the str.* helpers may be applied to it — everything here
+//          works on raw byte indexing and explicit offsets.
+module flat
+
+import "std/errors"
+import "std/fs"
+import "std/libc"
+import "std/math"
+import "std/str"
+
+// Magic identifies a flat perceptron model file.
+var Magic = "PROSETAG"
+
+// Version is the current format version.
+var Version = 1
+
+// MaxClasses is the ceiling implied by storing class IDs as uint8.
+var MaxClasses = 256
+
+// Model is a flat averaged-perceptron model, ready for scoring.
+//
+// Lookup is by feature string. Features are held in one sorted byte blob and
+// found by binary search.
+pub struct Model {
+    classes: []string // class ID -> name
+
+    data:      string // raw model bytes; binary — never pass through str.Len
+    blobStart: int    // absolute byte offset of the feature blob in data
+    blobLen:   int
+    featOff:   []int  // nFeatures+1 offsets into blob
+    pairOff:   []int  // nFeatures+1 offsets into classIDs/weights
+
+    classIDs: []int    // nPairs class indices
+    weights:  []float  // nPairs f32 weights widened to float
+
+    // tagMap holds unambiguous word -> class assignments, bypassing scoring.
+    tagMap: map[string]int
+}
+
+// Classes returns the class names, indexed by class ID.
+pub fn Classes(m: *Model) -> []string {
+    return m.classes
+}
+
+// NumFeatures reports how many distinct features the model knows.
+pub fn NumFeatures(m: *Model) -> int {
+    return len(m.featOff) - 1
+}
+
+// NumPairs reports how many feature-class weights the model holds.
+pub fn NumPairs(m: *Model) -> int {
+    return len(m.weights)
+}
+
+// TagFor returns the pre-assigned tag for an unambiguous word.
+//
+// The map stores classID+1 so that the zero value unambiguously means
+// "not present" (class 0 is a real: tag).
+pub fn TagFor(m: *Model, word: string) -> (string, bool) {
+    id := m.tagMap[word]
+    if id > 0 {
+        return m.classes[id - 1], true
+    }
+    return "", false
+}
+
+// blobSlice extracts the bytes data[lo:hi] as a clean NUL-terminated string.
+// The model buffer is binary data, so str.Substr (which calls: strlen) cannot
+// be used on it.
+fn blobSlice(data: string, lo: int, hi: int) -> string {
+    n := hi - lo
+    buf := libc.malloc(n + 1)
+    if n > 0 {
+        libc.memcpy(buf, string(int64(data) + int64(lo)), n)
+    }
+    buf[n] = 0
+    return buf
+}
+
+// blobCmp compares the blob slice [lo,hi) against s bytewise, returning
+// -1, 0, or 1 like a three-way lexicographic compare.
+fn blobCmp(m: *Model, lo: int, hi: int, s: string) -> int {
+    n := hi - lo
+    sl := str.Len(s)
+    k := 0
+    lim := n
+    if sl < lim {
+        lim = sl
+    }
+    for k < lim {
+        a := m.data[m.blobStart + lo + k]
+        b := s[k]
+        if a < b {
+            return -1
+        }
+        if a > b {
+            return 1
+        }
+        k = k + 1
+    }
+    if n < sl {
+        return -1
+    }
+    if n > sl {
+        return 1
+    }
+    return 0
+}
+
+// blobEqual reports whether the blob slice [lo,hi) equals s exactly.
+fn blobEqual(m: *Model, lo: int, hi: int, s: string) -> bool {
+    return blobCmp(m, lo, hi, s) == 0
+}
+
+// feature returns the index of feat, or -1. Binary search over the blob.
+fn feature(m: *Model, feat: string) -> int {
+    n := len(m.featOff) - 1
+    lo := 0
+    hi := n
+    for lo < hi {
+        mid := lo + (hi - lo) / 2
+        if blobCmp(m, m.featOff[mid], m.featOff[mid + 1], feat) >= 0 {
+            hi = mid
+        } else {
+            lo = mid + 1
+        }
+    }
+    if lo < n && blobEqual(m, m.featOff[lo], m.featOff[lo + 1], feat) {
+        return lo
+    }
+    return -1
+}
+
+// AccumulateInto adds the weights of feat, scaled by value, into scores.
+// scores must be at least len(m.classes) long. Reports whether feat was known.
+pub fn AccumulateInto(m: *Model, feat: string, value: float, scores: []float) -> bool {
+    i := feature(m, feat)
+    if i < 0 {
+        return false
+    }
+    lo := m.pairOff[i]
+    hi := m.pairOff[i + 1]
+    for j := lo; j < hi; j = j + 1 {
+        scores[m.classIDs[j]] = scores[m.classIDs[j]] + value * m.weights[j]
+    }
+    return true
+}
+
+// Best returns the highest-scoring class name.
+//
+// Ties break toward the lowest class ID, so the result is deterministic.
+pub fn Best(m: *Model, scores: []float) -> string {
+    best := -1.0e308 * 1.0e308 // -Inf
+    bestID := -1
+    for id := 0; id < len(m.classes); id = id + 1 {
+        if scores[id] > best {
+            best = scores[id]
+            bestID = id
+        }
+    }
+    if bestID < 0 {
+        return ""
+    }
+    return m.classes[bestID]
+}
+
+// --- decoding ---------------------------------------------------------------
+
+// f32FromBits widens an IEEE-754 binary32 value to a float.
+fn f32FromBits(bits: int) -> float {
+    sign := 1.0
+    if ((bits >> 31) & 1) != 0 {
+        sign = -1.0
+    }
+    exp := (bits >> 23) & 255
+    mant := bits & 8388607
+    if exp == 255 {
+        // Infinity (NaN never occurs in model: weights).
+        return sign * (1.0 / 0.0)
+    }
+    if exp == 0 {
+        // Subnormal: mant * 2^-149.
+        return sign * float(mant) * math.Pow(2.0, -149.0)
+    }
+    return sign * (1.0 + float(mant) / 8388608.0) * math.Pow(2.0, float(exp - 127))
+}
+
+fn ru8(data: string, pos: int) -> int {
+    return data[pos]
+}
+
+fn ru16(data: string, pos: int) -> int {
+    return data[pos] | (data[pos + 1] << 8)
+}
+
+fn ru32(data: string, pos: int) -> int {
+    return data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16) |
+        (data[pos + 3] << 24)
+}
+
+// Unmarshal decodes a flat model from its raw bytes.
+//
+// The data string may contain NUL bytes; it is accessed only through raw
+// indexing and explicit offsets, never str.Len/Substr.
+pub fn Unmarshal(data: string, size: int) -> (Model, errors.Error) {
+    var m Model
+    pos := 0
+
+    if size < 12 {
+        return m, errors.New("truncated model")
+    }
+    magic := blobSlice(data, 0, 8)
+    if magic != "PROSETAG" {
+        return m, errors.New("not a prose flat tagger model")
+    }
+    pos = pos + 8
+
+    v := ru32(data, pos)
+    pos = pos + 4
+    if v != 1 {
+        return m, errors.New("unsupported model version")
+    }
+
+    nClasses := ru32(data, pos)
+    pos = pos + 4
+    if nClasses > MaxClasses {
+        return m, errors.New("model has too many classes")
+    }
+    classes := []string{}
+    for i := 0; i < nClasses; i = i + 1 {
+        n := ru16(data, pos)
+        pos = pos + 2
+        classes = append(classes, blobSlice(data, pos, pos + n))
+        pos = pos + n
+    }
+    m.classes = classes
+
+    nFeatures := ru32(data, pos)
+    pos = pos + 4
+    nPairs := ru32(data, pos)
+    pos = pos + 4
+    blobLen := ru32(data, pos)
+    pos = pos + 4
+
+    m.data = data
+    m.blobStart = pos
+    m.blobLen = blobLen
+    pos = pos + blobLen
+
+    featOff := []int{}
+    for i := 0; i < nFeatures + 1; i = i + 1 {
+        featOff = append(featOff, ru32(data, pos))
+        pos = pos + 4
+    }
+    m.featOff = featOff
+
+    pairOff := []int{}
+    for i := 0; i < nFeatures + 1; i = i + 1 {
+        pairOff = append(pairOff, ru32(data, pos))
+        pos = pos + 4
+    }
+    m.pairOff = pairOff
+
+    classIDs := []int{}
+    for i := 0; i < nPairs; i = i + 1 {
+        classIDs = append(classIDs, ru8(data, pos))
+        pos = pos + 1
+    }
+    m.classIDs = classIDs
+
+    weights := []float{}
+    for i := 0; i < nPairs; i = i + 1 {
+        weights = append(weights, f32FromBits(ru32(data, pos)))
+        pos = pos + 4
+    }
+    m.weights = weights
+
+    m.tagMap = make(map[string]int)
+    nTagMap := ru32(data, pos)
+    pos = pos + 4
+    for i := 0; i < nTagMap; i = i + 1 {
+        n := ru16(data, pos)
+        pos = pos + 2
+        w := blobSlice(data, pos, pos + n)
+        pos = pos + n
+        id := ru8(data, pos)
+        pos = pos + 1
+        if id >= nClasses {
+            return m, errors.New("tagMap entry has out-of-range class ID")
+        }
+        m.tagMap[w] = id + 1
+    }
+    if pos > size {
+        return m, errors.New("truncated model")
+    }
+    err := validate(m)
+    if err.message != "" {
+        return m, err
+    }
+    return m, errors.None()
+}
+
+// validate checks the invariants the scoring path relies on, so a corrupt
+// model fails at load with a clear message instead of mid-tag.
+fn validate(m: Model) -> errors.Error {
+    n := len(m.featOff) - 1
+    if len(m.pairOff) != n + 1 {
+        return errors.New("offset arrays disagree")
+    }
+    if len(m.classIDs) != len(m.weights) {
+        return errors.New("classIDs and weights differ in length")
+    }
+    if n > 0 {
+        if m.featOff[n] != m.blobLen {
+            return errors.New("feature offsets do not end at the blob length")
+        }
+        if m.pairOff[n] != len(m.weights) {
+            return errors.New("pair offsets do not end at the weights length")
+        }
+    }
+    for i := 0; i < len(m.classIDs); i = i + 1 {
+        if m.classIDs[i] >= len(m.classes) {
+            return errors.New("class ID out of range")
+        }
+    }
+    // The binary search in feature() is only correct on sorted input.
+    for i := 1; i < n; i = i + 1 {
+        if !lessBlob(&m, m.featOff[i - 1], m.featOff[i], m.featOff[i], m.featOff[i + 1]) {
+            return errors.New("features not sorted")
+        }
+    }
+    return errors.None()
+}
+
+// lessBlob compares two blob slices bytewise.
+fn lessBlob(m: *Model, aLo: int, aHi: int, bLo: int, bHi: int) -> bool {
+    an := aHi - aLo
+    bn := bHi - bLo
+    lim := an
+    if bn < lim {
+        lim = bn
+    }
+    for k := 0; k < lim; k = k + 1 {
+        a := m.data[m.blobStart + aLo + k]
+        b := m.data[m.blobStart + bLo + k]
+        if a < b {
+            return true
+        }
+        if a > b {
+            return false
+        }
+    }
+    return an < bn
+}
+
+// Load reads and decodes a flat model from a file.
+pub fn Load(path: string) -> (Model, errors.Error) {
+    if !fs.IsFile(path) {
+        var m Model
+        return m, errors.New(str.Concat("model file not found: ", path))
+    }
+    data, err := fs.ReadAll(path)
+    if err.message != "" {
+        var m Model
+        return m, err
+    }
+    size := int(fs.FileSize(path))
+    return Unmarshal(data, size)
+}

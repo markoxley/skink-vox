@@ -1,0 +1,100 @@
+// File:    vox_test.skink
+// Purpose: Unit tests for the vox document pipeline — stage options,
+//          the functional-option form, and the collected results.
+module vox_test
+
+import "vox"
+import "tokenize"
+import "testing"
+
+// TestFullPipeline checks NewDocument produces all stages.
+pub fn TestFullPipeline() {
+    doc, err := vox.NewDocument("Marie Curie studied in Paris. She won the Nobel Prize twice.")
+    testing.AssertEqualString("", err.message, "build")
+    testing.AssertTrue(len(doc.Tokens()) > 0, "tokens")
+    testing.AssertTrue(len(doc.Sentences()) == 2, "sentences")
+    testing.AssertTrue(len(doc.Entities()) > 0, "entities")
+    // Tags and labels are populated.
+    testing.AssertTrue(doc.Tokens()[0].Tag != "", "tagged")
+    testing.AssertTrue(doc.Tokens()[0].Label != "", "labeled")
+}
+
+// TestStageToggles checks each pipeline stage can be disabled.
+pub fn TestStageToggles() {
+    // Segmentation off.
+    opts := vox.DefaultDocOpts()
+    opts.Segment = false
+    doc, err := vox.NewDocumentOpts("One two. Three four.", opts)
+    testing.AssertEqualString("", err.message, "build")
+    testing.AssertTrue(len(doc.Sentences()) == 0, "no sentences")
+    testing.AssertTrue(len(doc.Tokens()) > 0, "tokens still produced")
+
+    // Tagging off disables extraction input but tokens remain.
+    opts2 := vox.DefaultDocOpts()
+    opts2.Tag = false
+    opts2.Extract = false
+    doc2, _ := vox.NewDocumentOpts("One two. Three four.", opts2)
+    testing.AssertTrue(doc2.Tokens()[0].Tag == "", "untagged")
+    testing.AssertTrue(len(doc2.Entities()) == 0, "no entities")
+}
+
+// TestDependencies checks extract implies tag, tag implies tokenize.
+pub fn TestDependencies() {
+    opts := vox.DefaultDocOpts()
+    opts.Tokenize = false
+    opts.Tag = false
+    opts.Extract = true
+    doc, _ := vox.NewDocumentOpts("Marie Curie studied in Paris.", opts)
+    testing.AssertTrue(len(doc.Tokens()) > 0, "extract pulls in tokenize")
+    testing.AssertTrue(doc.Tokens()[0].Tag != "", "extract pulls in tagging")
+}
+
+// TestOptions checks the functional-option form.
+pub fn TestOptions() {
+    doc, err := vox.NewDocumentOptions("One two. Three four.", []vox.Option{
+        vox.WithExtraction(false),
+        vox.WithTagging(false),
+    })
+    testing.AssertEqualString("", err.message, "build")
+    testing.AssertTrue(len(doc.Tokens()) == 6, "tokens")
+    testing.AssertTrue(len(doc.Sentences()) == 2, "sentences")
+    testing.AssertTrue(len(doc.Entities()) == 0, "no entities")
+
+    doc2, _ := vox.NewDocumentOptions("One two. Three four.", []vox.Option{
+        vox.WithSegmentation(false),
+        vox.WithExtraction(false),
+        vox.WithTagging(false),
+    })
+    testing.AssertTrue(len(doc2.Sentences()) == 0, "segmentation off")
+
+    doc3, _ := vox.NewDocumentOptions("One two.", []vox.Option{
+        vox.WithTokenization(false),
+        vox.WithSegmentation(false),
+        vox.WithExtraction(false),
+        vox.WithTagging(false),
+    })
+    testing.AssertTrue(len(doc3.Tokens()) == 0, "tokenization off")
+}
+
+// TestUsingTokenizer checks a custom tokenizer reaches the pipeline.
+pub fn TestUsingTokenizer() {
+    tk := tokenize.NewTokenizerOpts([]tokenize.Option{
+        tokenize.UsingSplitCases([]string{}),
+    })
+    doc, err := vox.NewDocumentOptions("They'll win.", []vox.Option{
+        vox.UsingTokenizer(tk),
+        vox.WithExtraction(false),
+        vox.WithTagging(false),
+    })
+    testing.AssertEqualString("", err.message, "build")
+    testing.AssertEqualString("They'll", doc.Tokens()[0].Text, "custom tokenizer used")
+}
+
+// TestEmptyDocument checks degenerate input.
+pub fn TestEmptyDocument() {
+    doc, err := vox.NewDocument("")
+    testing.AssertEqualString("", err.message, "empty builds")
+    testing.AssertTrue(len(doc.Tokens()) == 0, "no tokens")
+    testing.AssertTrue(len(doc.Sentences()) == 0, "no sentences")
+    testing.AssertTrue(len(doc.Entities()) == 0, "no entities")
+}
