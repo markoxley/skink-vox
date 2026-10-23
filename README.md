@@ -22,10 +22,26 @@ the module itself is pure Skink).
 | `summarize` | `Document` metrics, readability formulas, `Syllables`            |
 | `token`     | Shared `Token` type                                              |
 
+## Installation
+
+vox is distributed through `scales`, the Skink package manager. Inside a
+project directory (one containing a `skink.toml` — create one with
+`scales init` if needed):
+
+```sh
+scales add mod/markoxley/skink-vox            # latest, records it in skink.toml
+scales add mod/markoxley/skink-vox@v1.0.0     # pin a specific tag
+```
+
+This fetches the package into the shared scales cache
+(`~/.local/skink/scales/packages/...`) and writes `skink.toml` +
+`skink.lock`. `scales install` restores the cache on a fresh machine —
+no sources are copied into your project.
+
 ## Quick start
 
 ```skink
-import "mod/<owner>/skink-vox"
+import "mod/markoxley/skink-vox"
 
 fn main() {
     doc, err := vox.NewDocument("Marie Curie studied in Paris.")
@@ -43,9 +59,9 @@ fn main() {
 Individual stages import directly:
 
 ```skink
-import "mod/<owner>/skink-vox/tokenize"
-import "mod/<owner>/skink-vox/tag"
-import "mod/<owner>/skink-vox/ner"
+import "mod/markoxley/skink-vox/tokenize"
+import "mod/markoxley/skink-vox/tag"
+import "mod/markoxley/skink-vox/ner"
 
 tk := tokenize.NewTokenizer()
 toks := tk.Tokenize(text)
