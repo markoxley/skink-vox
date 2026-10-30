@@ -3,12 +3,17 @@
 //          recognizer. It is a set rather than a slice: the lookup is one of
 //          the recognizer's per-token features, so a linear scan would cost
 //          850 string comparisons per token.
+//
+//          Uses a builtin map, not std/hashmap — generic HashMap<K,V>
+//          lookups hash erased i8* keys through a mapped-memory heuristic
+//          that has been observed to misclassify string literals
+//          depending on module import layout (comp_error.md), making
+//          membership tests nondeterministic across binaries.
 module wordlist
 
 import "internal/wordlist_data"
-import "std/hashmap"
 
-var basic = hashmap.New<string, int>()
+var basic = make(map[string]bool)
 var loaded = false
 
 // ensure builds the set on first use.
@@ -17,7 +22,7 @@ fn ensure() {
         return
     }
     for i := 0; i < len(wordlist_data.Words); i = i + 1 {
-        basic.Put(wordlist_data.Words[i], 1)
+        basic[wordlist_data.Words[i]] = true
     }
     loaded = true
 }
@@ -25,7 +30,8 @@ fn ensure() {
 // IsBasic reports whether word is in Ogden's Basic English list.
 pub fn IsBasic(word: string) -> bool {
     ensure()
-    return basic.Has(word)
+    _, ok := basic[word]
+    return ok
 }
 
 // Len returns the number of words in the list.

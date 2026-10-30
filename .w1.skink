@@ -1,0 +1,14 @@
+module main
+import "std/testing"
+import "internal_test"
+import "internal/wordlist"
+import "std/io"
+import "std/strconv"
+
+fn main() -> int {
+    io.PrintLine(strconv.Itoa64(int64(wordlist.IsBasic("the"))) + " direct")
+    testing.Reset()
+    internal_test.TestWordlist()
+    io.PrintLine(strconv.Itoa64(int64(wordlist.IsBasic("the"))) + " after")
+    return 0
+}

@@ -1,0 +1,10 @@
+module main
+import "std/testing"
+import "probe_mod"
+import "internal_test"
+
+fn main() -> int {
+    probe_mod.Probe()
+    internal_test.TestWordlist()
+    return 0
+}
