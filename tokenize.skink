@@ -35,6 +35,12 @@ import "token"
 
 // Token is token.Token, re-exported so callers using only this
 // module do not have to import token themselves.
+
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 pub type Token = token.Token
 
 // Tokenizer splits text into tokens.
@@ -147,11 +153,11 @@ fn isInternalAbbrev(span: string) -> bool {
         return false
     }
     // ^[A-Z][a-z]{1,2}\.$
-    if n >= 3 && isUpper(span[0]) && isLower(span[1]) && span[n - 1] == 46 {
+    if n >= 3 && isUpper(Skink_mem_byte(span, int64(0))) && isLower(Skink_mem_byte(span, int64(1))) && Skink_mem_byte(span, int64(n - 1)) == 46 {
         if n == 3 {
             return true
         }
-        if n == 4 && isLower(span[2]) {
+        if n == 4 && isLower(Skink_mem_byte(span, int64(2))) {
             return true
         }
     }
@@ -161,10 +167,10 @@ fn isInternalAbbrev(span: string) -> bool {
     }
     i := 0
     for i < n {
-        if !isLetter(span[i]) {
+        if !isLetter(Skink_mem_byte(span, int64(i))) {
             return false
         }
-        if span[i + 1] != 46 {
+        if Skink_mem_byte(span, int64(i + 1)) != 46 {
             return false
         }
         i = i + 2
@@ -331,7 +337,7 @@ fn indexFoldASCII(s: string, substr: string) -> int {
 fn equalFoldASCII(a: string, b: string) -> bool {
     for i := 0; i < str.Len(a); i = i + 1 {
         ca := a[i]
-        cb := b[i]
+        cb := Skink_mem_byte(b, int64(i))
         if ca >= 65 && ca <= 90 {
             ca = ca + 32
         }
@@ -458,11 +464,11 @@ pub struct BlanklineTokenizer {
         n := str.Len(text)
         for i < n {
             // A gap is a run of \s bytes containing at least two '\n'.
-            if isGoSpace(text[i]) {
+            if isGoSpace(Skink_mem_byte(text, int64(i))) {
                 j := i
                 newlines := 0
-                for j < n && isGoSpace(text[j]) {
-                    if text[j] == 10 {
+                for j < n && isGoSpace(Skink_mem_byte(text, int64(j))) {
+                    if Skink_mem_byte(text, int64(j)) == 10 {
                         newlines = newlines + 1
                     }
                     j = j + 1
@@ -515,18 +521,18 @@ pub struct WordPunctTokenizer {
         n := str.Len(text)
         i := 0
         for i < n {
-            b := text[i]
+            b := Skink_mem_byte(text, int64(i))
             if isGoSpace(b) {
                 i = i + 1
                 continue
             }
             j := i
             if isWordByte(b) {
-                for j < n && isWordByte(text[j]) {
+                for j < n && isWordByte(Skink_mem_byte(text, int64(j))) {
                     j = j + 1
                 }
             } else {
-                for j < n && !isWordByte(text[j]) && !isGoSpace(text[j]) {
+                for j < n && !isWordByte(Skink_mem_byte(text, int64(j))) && !isGoSpace(Skink_mem_byte(text, int64(j))) {
                     j = j + 1
                 }
             }
@@ -562,9 +568,9 @@ pub struct WordBoundaryTokenizer {
         i := 0
         for i < n {
             // Alternative 1: (?:[A-Z]\.){2,} — maximal run of Capital+dot pairs.
-            if text[i] >= 65 && text[i] <= 90 && i + 1 < n && text[i + 1] == 46 {
+            if Skink_mem_byte(text, int64(i)) >= 65 && Skink_mem_byte(text, int64(i)) <= 90 && i + 1 < n && Skink_mem_byte(text, int64(i + 1)) == 46 {
                 j := i
-                for j + 1 < n && text[j] >= 65 && text[j] <= 90 && text[j + 1] == 46 {
+                for j + 1 < n && Skink_mem_byte(text, int64(j)) >= 65 && Skink_mem_byte(text, int64(j)) <= 90 && Skink_mem_byte(text, int64(j + 1)) == 46 {
                     j = j + 2
                 }
                 if j - i >= 4 {
@@ -622,7 +628,7 @@ pub struct TreebankWordTokenizer {
 
         // starting quotes
         text = subQuoteSep(text)
-        if str.Len(text) > 0 && text[0] == 34 {
+        if str.Len(text) > 0 && Skink_mem_byte(text, int64(0)) == 34 {
             text = str.Concat("``", str.Substr(text, 1, str.Len(text) - 1))
         }
         text = subAll(text, " \"", " ``")
@@ -691,13 +697,13 @@ fn subQuoteSep(text: string) -> string {
     i := 0
     n := str.Len(text)
     for i < n {
-        if i + 2 < n && text[i] == 39 && isTreebankSep(text[i + 1]) && text[i + 2] == 34 {
-            str.WriteByte(&b, text[i + 1])
+        if i + 2 < n && Skink_mem_byte(text, int64(i)) == 39 && isTreebankSep(Skink_mem_byte(text, int64(i + 1))) && Skink_mem_byte(text, int64(i + 2)) == 34 {
+            str.WriteByte(&b, Skink_mem_byte(text, int64(i + 1)))
             str.Write(&b, " `` ")
             i = i + 3
             continue
         }
-        str.WriteByte(&b, text[i])
+        str.WriteByte(&b, Skink_mem_byte(text, int64(i)))
         i = i + 1
     }
     return str.String(b)
@@ -715,7 +721,7 @@ fn subCommaNonDigit(text: string) -> string {
     i := 0
     n := str.Len(text)
     for i < n {
-        c := text[i]
+        c := Skink_mem_byte(text, int64(i))
         if (c == 44 || c == 58) && i + 1 < n {
             r, size := unicode.DecodeRune(text, i + 1)
             if size < 1 {
@@ -742,13 +748,13 @@ fn subFinalPeriod(text: string) -> string {
     n := str.Len(text)
     end := n
     // trailing \s*
-    for end > 0 && isGoSpace(text[end - 1]) {
+    for end > 0 && isGoSpace(Skink_mem_byte(text, int64(end - 1))) {
         end = end - 1
     }
     // closing chars [\]\)}>"']
     k := end
     for k > 0 {
-        c := text[k - 1]
+        c := Skink_mem_byte(text, int64(k - 1))
         if c == 93 || c == 41 || c == 125 || c == 62 || c == 34 || c == 39 {
             k = k - 1
             continue
@@ -756,7 +762,7 @@ fn subFinalPeriod(text: string) -> string {
         break
     }
     closers := str.Substr(text, k, end - k)
-    if k < 2 || text[k - 1] != 46 {
+    if k < 2 || Skink_mem_byte(text, int64(k - 1)) != 46 {
         return text
     }
     // rune before the dot must not be '.'
@@ -783,19 +789,19 @@ fn subQuoteSpace(text: string) -> string {
     i := 0
     n := str.Len(text)
     for i + 2 <= n && i < n {
-        if i + 2 <= n && i > 0 && text[i] == 39 && text[i + 1] == 32 &&
-            text[i - 1] != 39 {
+        if i + 2 <= n && i > 0 && Skink_mem_byte(text, int64(i)) == 39 && Skink_mem_byte(text, int64(i + 1)) == 32 &&
+            Skink_mem_byte(text, int64(i - 1)) != 39 {
             // previous byte is the tail of the prior rune — a multi-byte
             // rune is never 39, so checking the byte is safe.
             str.Write(&b, " ' ")
             i = i + 2
             continue
         }
-        str.WriteByte(&b, text[i])
+        str.WriteByte(&b, Skink_mem_byte(text, int64(i)))
         i = i + 1
     }
     for i < n {
-        str.WriteByte(&b, text[i])
+        str.WriteByte(&b, Skink_mem_byte(text, int64(i)))
         i = i + 1
     }
     return str.String(b)
@@ -804,11 +810,11 @@ fn subQuoteSpace(text: string) -> string {
 // subEndPunct replaces `([:,])$` with " $1 ".
 fn subEndPunct(text: string) -> string {
     n := str.Len(text)
-    if n > 0 && (text[n - 1] == 44 || text[n - 1] == 58) {
+    if n > 0 && (Skink_mem_byte(text, int64(n - 1)) == 44 || Skink_mem_byte(text, int64(n - 1)) == 58) {
         b := str.NewBuilder(n + 4)
         str.Write(&b, str.Substr(text, 0, n - 1))
         str.Write(&b, " ")
-        str.WriteByte(&b, text[n - 1])
+        str.WriteByte(&b, Skink_mem_byte(text, int64(n - 1)))
         str.Write(&b, " ")
         return str.String(b)
     }
@@ -821,7 +827,7 @@ fn subPunctChars(text: string) -> string {
     i := 0
     n := str.Len(text)
     for i < n {
-        c := text[i]
+        c := Skink_mem_byte(text, int64(i))
         if c == 59 || c == 64 || c == 35 || c == 36 || c == 37 || c == 38 ||
             c == 63 || c == 33 {
             str.Write(&b, " ")
@@ -842,7 +848,7 @@ fn subBrackets(text: string) -> string {
     i := 0
     n := str.Len(text)
     for i < n {
-        c := text[i]
+        c := Skink_mem_byte(text, int64(i))
         if c == 93 || c == 91 || c == 40 || c == 41 || c == 123 || c == 125 ||
             c == 60 || c == 62 {
             str.Write(&b, " ")
@@ -870,21 +876,21 @@ fn subEndQuote1(text: string) -> string {
     i := 0
     n := str.Len(text)
     for i < n {
-        if text[i] == 39 {
+        if Skink_mem_byte(text, int64(i)) == 39 {
             _, size := unicode.DecodeRune(text, i + 1)
             if size < 1 {
                 size = 1
             }
             j := i + 1 + size
             if j + 2 < n && !isGoSpaceRune(text, i + 1) &&
-                text[j] == 39 && text[j + 1] == 39 && text[j + 2] == 39 {
+                Skink_mem_byte(text, int64(j)) == 39 && Skink_mem_byte(text, int64(j + 1)) == 39 && Skink_mem_byte(text, int64(j + 2)) == 39 {
                 str.Write(&b, str.Substr(text, i + 1, size))
                 str.Write(&b, " '' ")
                 i = j + 3
                 continue
             }
         }
-        str.WriteByte(&b, text[i])
+        str.WriteByte(&b, Skink_mem_byte(text, int64(i)))
         i = i + 1
     }
     return str.String(b)
@@ -906,12 +912,12 @@ fn subContractionTail(text: string, tails: []string) -> string {
     n := str.Len(text)
     for i < n {
         matched := false
-        if i > 0 && text[i - 1] != 39 && text[i - 1] != 32 {
+        if i > 0 && Skink_mem_byte(text, int64(i - 1)) != 39 && Skink_mem_byte(text, int64(i - 1)) != 32 {
             for t := 0; t < len(tails); t = t + 1 {
                 tail := tails[t]
                 tl := str.Len(tail)
                 if i + tl < n && str.Substr(text, i, tl) == tail &&
-                    text[i + tl] == 32 {
+                    Skink_mem_byte(text, int64(i + tl)) == 32 {
                     str.Write(&b, " ")
                     str.Write(&b, tail)
                     str.Write(&b, " ")
@@ -924,7 +930,7 @@ fn subContractionTail(text: string, tails: []string) -> string {
         if matched {
             continue
         }
-        str.WriteByte(&b, text[i])
+        str.WriteByte(&b, Skink_mem_byte(text, int64(i)))
         i = i + 1
     }
     return str.String(b)
@@ -936,7 +942,7 @@ fn isWordByteAt(text: string, i: int) -> bool {
     if i < 0 || i >= str.Len(text) {
         return false
     }
-    return isWordByte(text[i])
+    return isWordByte(Skink_mem_byte(text, int64(i)))
 }
 
 // foldAt reports whether text[i:i+len(word)] equals word, ASCII case-folded.
@@ -946,8 +952,8 @@ fn foldAt(text: string, i: int, word: string) -> bool {
         return false
     }
     for k := 0; k < wl; k = k + 1 {
-        a := text[i + k]
-        b := word[k]
+        a := Skink_mem_byte(text, int64(i + k))
+        b := Skink_mem_byte(word, int64(k))
         if a >= 65 && a <= 90 {
             a = a + 32
         }
@@ -972,8 +978,8 @@ fn subWordContract(text: string, w1: string, w2: string, needLeadSpace: bool, ne
     for i < n {
         start := i
         if needLeadSpace {
-            if text[i] != 32 {
-                str.WriteByte(&b, text[i])
+            if Skink_mem_byte(text, int64(i)) != 32 {
+                str.WriteByte(&b, Skink_mem_byte(text, int64(i)))
                 i = i + 1
                 continue
             }
@@ -983,8 +989,8 @@ fn subWordContract(text: string, w1: string, w2: string, needLeadSpace: bool, ne
             !isWordByteAt(text, start - 1) &&
             (needTailSpace || !isWordByteAt(text, start + wl)) {
             if needTailSpace {
-                if start + wl >= n || text[start + wl] != 32 {
-                    str.WriteByte(&b, text[i])
+                if start + wl >= n || Skink_mem_byte(text, int64(start + wl)) != 32 {
+                    str.WriteByte(&b, Skink_mem_byte(text, int64(i)))
                     i = i + 1
                     continue
                 }
@@ -1001,10 +1007,10 @@ fn subWordContract(text: string, w1: string, w2: string, needLeadSpace: bool, ne
             continue
         }
         if needLeadSpace {
-            str.WriteByte(&b, text[i])
+            str.WriteByte(&b, Skink_mem_byte(text, int64(i)))
             i = i + 1
         } else {
-            str.WriteByte(&b, text[i])
+            str.WriteByte(&b, Skink_mem_byte(text, int64(i)))
             i = i + 1
         }
     }
@@ -1017,14 +1023,14 @@ fn collapseSpaces(text: string) -> string {
     i := 0
     n := str.Len(text)
     for i < n {
-        if text[i] == 32 && i + 1 < n && text[i + 1] == 32 {
-            for i < n && text[i] == 32 {
+        if Skink_mem_byte(text, int64(i)) == 32 && i + 1 < n && Skink_mem_byte(text, int64(i + 1)) == 32 {
+            for i < n && Skink_mem_byte(text, int64(i)) == 32 {
                 i = i + 1
             }
             str.WriteByte(&b, 32)
             continue
         }
-        str.WriteByte(&b, text[i])
+        str.WriteByte(&b, Skink_mem_byte(text, int64(i)))
         i = i + 1
     }
     return str.String(b)

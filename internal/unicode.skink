@@ -11,6 +11,12 @@ module unicode
 import "internal/unicode_data"
 import "std/str"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // ReplacementChar is returned when a byte sequence is not valid UTF-8.
 pub var ReplacementChar = 65533
 
@@ -22,31 +28,31 @@ pub fn DecodeRune(s: string, i: int) -> (int, int) {
     if i >= n {
         return 0, 0
     }
-    b0 := s[i]
+    b0 := Skink_mem_byte(s, int64(i))
     if b0 < 128 {
         return b0, 1
     }
     if b0 >= 194 && b0 < 224 {
-        if i + 1 < n && s[i + 1] >= 128 && s[i + 1] < 192 {
-            return ((b0 & 31) << 6) | (s[i + 1] & 63), 2
+        if i + 1 < n && Skink_mem_byte(s, int64(i + 1)) >= 128 && Skink_mem_byte(s, int64(i + 1)) < 192 {
+            return ((b0 & 31) << 6) | (Skink_mem_byte(s, int64(i + 1)) & 63), 2
         }
         return ReplacementChar, 1
     }
     if b0 >= 224 && b0 < 240 {
         if i + 2 < n &&
-            s[i + 1] >= 128 && s[i + 1] < 192 &&
-            s[i + 2] >= 128 && s[i + 2] < 192 {
-            return ((b0 & 15) << 12) | ((s[i + 1] & 63) << 6) | (s[i + 2] & 63), 3
+            Skink_mem_byte(s, int64(i + 1)) >= 128 && Skink_mem_byte(s, int64(i + 1)) < 192 &&
+            Skink_mem_byte(s, int64(i + 2)) >= 128 && Skink_mem_byte(s, int64(i + 2)) < 192 {
+            return ((b0 & 15) << 12) | ((Skink_mem_byte(s, int64(i + 1)) & 63) << 6) | (Skink_mem_byte(s, int64(i + 2)) & 63), 3
         }
         return ReplacementChar, 1
     }
     if b0 >= 240 && b0 < 245 {
         if i + 3 < n &&
-            s[i + 1] >= 128 && s[i + 1] < 192 &&
-            s[i + 2] >= 128 && s[i + 2] < 192 &&
-            s[i + 3] >= 128 && s[i + 3] < 192 {
-            return ((b0 & 7) << 18) | ((s[i + 1] & 63) << 12) |
-                ((s[i + 2] & 63) << 6) | (s[i + 3] & 63), 4
+            Skink_mem_byte(s, int64(i + 1)) >= 128 && Skink_mem_byte(s, int64(i + 1)) < 192 &&
+            Skink_mem_byte(s, int64(i + 2)) >= 128 && Skink_mem_byte(s, int64(i + 2)) < 192 &&
+            Skink_mem_byte(s, int64(i + 3)) >= 128 && Skink_mem_byte(s, int64(i + 3)) < 192 {
+            return ((b0 & 7) << 18) | ((Skink_mem_byte(s, int64(i + 1)) & 63) << 12) |
+                ((Skink_mem_byte(s, int64(i + 2)) & 63) << 6) | (Skink_mem_byte(s, int64(i + 3)) & 63), 4
         }
         return ReplacementChar, 1
     }
@@ -65,7 +71,7 @@ pub fn DecodeLastRune(s: string, end: int) -> (int, int) {
     if lim < 0 {
         lim = 0
     }
-    for start > lim && s[start] >= 128 && s[start] < 192 {
+    for start > lim && Skink_mem_byte(s, int64(start)) >= 128 && Skink_mem_byte(s, int64(start)) < 192 {
         start = start - 1
     }
     r, size := DecodeRune(s, start)

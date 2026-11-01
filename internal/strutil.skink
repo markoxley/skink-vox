@@ -7,6 +7,12 @@ import "internal/unicode"
 import "std/fs"
 import "std/str"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // HasAnySuffix reports whether s ends with any of the suffixes.
 pub fn HasAnySuffix(s: string, suffixes: []string) -> bool {
     for i := 0; i < len(suffixes); i = i + 1 {
@@ -52,7 +58,7 @@ pub fn StringInSlice(target: string, slice: []string) -> bool {
 // CharAt returns the byte at index i, or 0 if out of range.
 pub fn CharAt(s: string, i: int) -> int {
     if i >= 0 && i < str.Len(s) {
-        return s[i]
+        return Skink_mem_byte(s, int64(i))
     }
     return 0
 }

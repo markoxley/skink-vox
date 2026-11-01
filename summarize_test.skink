@@ -12,6 +12,12 @@ import "std/str"
 import "std/strconv"
 import "testing"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TestSyllableMap drives every word in testdata/syllables.json (the
 // reference's expected count map).
 pub fn TestSyllableMap() {

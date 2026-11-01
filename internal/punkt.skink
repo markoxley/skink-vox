@@ -21,6 +21,12 @@ import "std/hashmap"
 import "std/json"
 import "std/str"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // --- Token -------------------------------------------------------------------
 
 // PunktToken stores a token of text with annotations produced during
@@ -50,7 +56,7 @@ pub fn Punctuation() -> string {
 pub fn HasSentencePunct(text: string) -> bool {
     n := str.Len(text)
     for i := 0; i < n; i = i + 1 {
-        c := text[i]
+        c := Skink_mem_byte(text, int64(i))
         if c == 46 || c == 33 || c == 63 {
             return true
         }
@@ -79,7 +85,7 @@ fn isDigitByte(b: int) -> bool {
 // reEllipsis matches \.\.+$ — true when s ends with two or more periods.
 fn isEllipsisTok(s: string) -> bool {
     n := str.Len(s)
-    if n < 2 || s[n - 1] != 46 || s[n - 2] != 46 {
+    if n < 2 || Skink_mem_byte(s, int64(n - 1)) != 46 || Skink_mem_byte(s, int64(n - 2)) != 46 {
         return false
     }
     return true
@@ -122,10 +128,10 @@ fn numericType(typ: string) -> string {
 // reInitial matches ^[A-Za-z]\.$ — a single letter followed by a period.
 fn isInitialTok(s: string) -> bool {
     n := str.Len(s)
-    if n != 2 || s[1] != 46 {
+    if n != 2 || Skink_mem_byte(s, int64(1)) != 46 {
         return false
     }
-    c := s[0]
+    c := Skink_mem_byte(s, int64(0))
     return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
 }
 
@@ -136,7 +142,7 @@ fn isAlphaTok(s: string) -> bool {
         return false
     }
     for i := 0; i < n; i = i + 1 {
-        c := s[i]
+        c := Skink_mem_byte(s, int64(i))
         if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
             return false
         }
@@ -162,14 +168,14 @@ fn isNonPunctType(typ: string) -> bool {
 fn containsAbbr(s: string) -> bool {
     n := str.Len(s)
     for i := 0; i + 1 < n; i = i + 1 {
-        if !isWordASCII(s[i]) || s[i + 1] != 46 {
+        if !isWordASCII(Skink_mem_byte(s, int64(i))) || Skink_mem_byte(s, int64(i + 1)) != 46 {
             continue
         }
         k := i + 2
-        for k < n && isWordASCII(s[k]) {
+        for k < n && isWordASCII(Skink_mem_byte(s, int64(k))) {
             k = k + 1
         }
-        if k < n && s[k] == 46 {
+        if k < n && Skink_mem_byte(s, int64(k)) == 46 {
             return true
         }
     }
@@ -181,17 +187,17 @@ fn containsAbbr(s: string) -> bool {
 fn looksLikeEllipsis(s: string) -> bool {
     n := str.Len(s)
     for i := 0; i < n; i = i + 1 {
-        if s[i] != 46 {
+        if Skink_mem_byte(s, int64(i)) != 46 {
             continue
         }
         dots := 1
         j := i + 1
         for j < n {
             k := j
-            if s[k] != 46 && isSpaceRe(s[k]) {
+            if Skink_mem_byte(s, int64(k)) != 46 && isSpaceRe(Skink_mem_byte(s, int64(k))) {
                 k = k + 1
             }
-            if k < n && s[k] == 46 {
+            if k < n && Skink_mem_byte(s, int64(k)) == 46 {
                 dots = dots + 1
                 j = k + 1
                 continue

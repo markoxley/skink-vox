@@ -14,6 +14,12 @@ import "std/str"
 import "std/errors"
 import "testing"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TestCorpus tags every corpus input and compares every tag against the
 // reference goldens in tag_golden.json, plus the offset invariant.
 pub fn TestCorpus() {

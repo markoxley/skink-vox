@@ -5,6 +5,12 @@ module mathutil
 
 import "std/math"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // NaN returns the IEEE-754 not-a-number value (std/math does not export: one).
 pub fn NaN() -> float {
     return 0.0 / 0.0

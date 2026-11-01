@@ -30,6 +30,12 @@ import "std/libc"
 import "std/math"
 import "std/str"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // Magic identifies a flat perceptron model file.
 var Magic = "PROSETAG"
 
@@ -95,7 +101,7 @@ fn blobSlice(data: string, lo: int, hi: int) -> string {
     if n > 0 {
         libc.memcpy(buf, string(int64(data) + int64(lo)), n)
     }
-    buf[n] = 0
+    Skink_mem_write_byte(buf, int64(n), 0)
     return buf
 }
 
@@ -110,8 +116,8 @@ fn blobCmp(m: *Model, lo: int, hi: int, s: string) -> int {
         lim = sl
     }
     for k < lim {
-        a := m.data[m.blobStart + lo + k]
-        b := s[k]
+        a := Skink_mem_byte(m.data, int64(m.blobStart + lo + k))
+        b := Skink_mem_byte(s, int64(k))
         if a < b {
             return -1
         }
@@ -208,16 +214,16 @@ fn f32FromBits(bits: int) -> float {
 }
 
 fn ru8(data: string, pos: int) -> int {
-    return data[pos]
+    return Skink_mem_byte(data, int64(pos))
 }
 
 fn ru16(data: string, pos: int) -> int {
-    return data[pos] | (data[pos + 1] << 8)
+    return Skink_mem_byte(data, int64(pos)) | (Skink_mem_byte(data, int64(pos + 1)) << 8)
 }
 
 fn ru32(data: string, pos: int) -> int {
-    return data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16) |
-        (data[pos + 3] << 24)
+    return Skink_mem_byte(data, int64(pos)) | (Skink_mem_byte(data, int64(pos + 1)) << 8) | (Skink_mem_byte(data, int64(pos + 2)) << 16) |
+        (Skink_mem_byte(data, int64(pos + 3)) << 24)
 }
 
 // Unmarshal decodes a flat model from its raw bytes.
@@ -363,8 +369,8 @@ fn lessBlob(m: *Model, aLo: int, aHi: int, bLo: int, bHi: int) -> bool {
         lim = bn
     }
     for k := 0; k < lim; k = k + 1 {
-        a := m.data[m.blobStart + aLo + k]
-        b := m.data[m.blobStart + bLo + k]
+        a := Skink_mem_byte(m.data, int64(m.blobStart + aLo + k))
+        b := Skink_mem_byte(m.data, int64(m.blobStart + bLo + k))
         if a < b {
             return true
         }

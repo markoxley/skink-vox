@@ -26,6 +26,12 @@ import "std/fs"
 import "std/libc"
 import "std/str"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // Entity is a named entity found in text.
 //
 // Like token.Token, it carries its position, and the same invariant holds:
@@ -79,13 +85,13 @@ pub struct Extracter {
             return
         }
 
-        var history []string
+            var history []string
         labels := maxent.Labels(&e.model)
-        nLabels := len(labels)
+            nLabels := len(labels)
 
         for i := 0; i < len(tokens); i = i + 1 {
-            feats := extract(i, tokens, history)
-
+                    feats := extract(i, tokens, history)
+        
             best := 0
             bestScore := -1.0e308 * 1.0e308
             order := featureOrder()
@@ -109,8 +115,8 @@ pub struct Extracter {
                 }
             }
 
-            tokens[i].Label = labels[best]
-            history = append(history, simplePOS(labels[best]))
+                    tokens[i].Label = labels[best]
+                    history = append(history, simplePOS(labels[best]))
         }
     }
 
@@ -284,7 +290,14 @@ fn parseEntities(ents: []string) -> string {
     if strutil.StringInSlice("B-PERSON", ents) && len(ents) == 2 {
         return "PERSON"
     }
-    return str.Split(ents[0], "-")[1]
+    // Guard: an unusual model can emit a bare label with no B-/I- prefix
+    // (e.g. "PERSON" instead of "B-PERSON"); splitting on '-' would index
+    // past the single element.
+    parts := str.Split(ents[0], "-")
+    if len(parts) == 2 {
+        return parts[1]
+    }
+    return ents[0]
 }
 
 // coalesce turns a run of tokens into one entity.
@@ -411,7 +424,7 @@ fn isNumeric(s: string) -> bool {
         return false
     }
     i := 0
-    if s[i] == 43 || s[i] == 45 { // '+' or '-'
+    if Skink_mem_byte(s, int64(i)) == 43 || Skink_mem_byte(s, int64(i)) == 45 { // '+' or '-'
         i = i + 1
         if i >= n {
             return false
@@ -425,31 +438,31 @@ fn isNumeric(s: string) -> bool {
 
     // Hex float: 0x[hexdigits][.hexdigits]p[+-]?digits — the exponent is
     // required.
-    if str.Len(lower) > 2 && lower[0] == 48 && (lower[1] == 120 || lower[1] == 88) {
+    if str.Len(lower) > 2 && Skink_mem_byte(lower, int64(0)) == 48 && (Skink_mem_byte(lower, int64(1)) == 120 || Skink_mem_byte(lower, int64(1)) == 88) {
         j := 2
         m := str.Len(lower)
         mant := false
-        for j < m && (isHexDigit(lower[j]) || lower[j] == 95 || lower[j] == 46) {
-            if isHexDigit(lower[j]) {
+        for j < m && (isHexDigit(Skink_mem_byte(lower, int64(j))) || Skink_mem_byte(lower, int64(j)) == 95 || Skink_mem_byte(lower, int64(j)) == 46) {
+            if isHexDigit(Skink_mem_byte(lower, int64(j))) {
                 mant = true
             }
             j = j + 1
         }
-        if !mant || j >= m || (lower[j] != 112 && lower[j] != 80) { // 'p'/'P'
+        if !mant || j >= m || (Skink_mem_byte(lower, int64(j)) != 112 && Skink_mem_byte(lower, int64(j)) != 80) { // 'p'/'P'
             return false
         }
         j = j + 1
-        if j < m && (lower[j] == 43 || lower[j] == 45) {
+        if j < m && (Skink_mem_byte(lower, int64(j)) == 43 || Skink_mem_byte(lower, int64(j)) == 45) {
             j = j + 1
         }
         exp := false
         prevDigit := true
         for j < m {
-            c := lower[j]
+            c := Skink_mem_byte(lower, int64(j))
             if c >= 48 && c <= 57 {
                 exp = true
                 prevDigit = true
-            } else if c == 95 && prevDigit && j + 1 < m && lower[j + 1] >= 48 && lower[j + 1] <= 57 {
+            } else if c == 95 && prevDigit && j + 1 < m && Skink_mem_byte(lower, int64(j + 1)) >= 48 && Skink_mem_byte(lower, int64(j + 1)) <= 57 {
                 prevDigit = false
             } else {
                 return false
@@ -467,14 +480,14 @@ fn isNumeric(s: string) -> bool {
     j := 0
     m := str.Len(lower)
     for j < m {
-        c := lower[j]
+        c := Skink_mem_byte(lower, int64(j))
         if c >= 48 && c <= 57 {
             mant = true
             prevDigit = true
         } else if c == 46 && !sawDot {
             sawDot = true
             prevDigit = false
-        } else if c == 95 && prevDigit && j + 1 < m && lower[j + 1] >= 48 && lower[j + 1] <= 57 {
+        } else if c == 95 && prevDigit && j + 1 < m && Skink_mem_byte(lower, int64(j + 1)) >= 48 && Skink_mem_byte(lower, int64(j + 1)) <= 57 {
             prevDigit = false
         } else {
             break
@@ -485,21 +498,21 @@ fn isNumeric(s: string) -> bool {
         return false
     }
     if j < m {
-        if lower[j] != 101 && lower[j] != 69 { // 'e'/'E'
+        if Skink_mem_byte(lower, int64(j)) != 101 && Skink_mem_byte(lower, int64(j)) != 69 { // 'e'/'E'
             return false
         }
         j = j + 1
-        if j < m && (lower[j] == 43 || lower[j] == 45) {
+        if j < m && (Skink_mem_byte(lower, int64(j)) == 43 || Skink_mem_byte(lower, int64(j)) == 45) {
             j = j + 1
         }
         exp := false
         prevDigit = true
         for j < m {
-            c := lower[j]
+            c := Skink_mem_byte(lower, int64(j))
             if c >= 48 && c <= 57 {
                 exp = true
                 prevDigit = true
-            } else if c == 95 && prevDigit && j + 1 < m && lower[j + 1] >= 48 && lower[j + 1] <= 57 {
+            } else if c == 95 && prevDigit && j + 1 < m && Skink_mem_byte(lower, int64(j + 1)) >= 48 && Skink_mem_byte(lower, int64(j + 1)) <= 57 {
                 prevDigit = false
             } else {
                 return false

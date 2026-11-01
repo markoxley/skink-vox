@@ -1,3 +1,7 @@
+// File:    main.skink
+// Purpose: Command-line entry point for skink-vox — a small demo/REPL
+//          driver that exercises the vox NLP pipeline (tokenize, tag,
+//          segment, NER, readability metrics) on text input.
 module main
 
 fn main() -> int {

@@ -15,6 +15,12 @@ import "tokenize"
 import "std/str"
 import "testing"
 
+// Raw byte accessors for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TestTokenize checks the default tokenizer's word and punctuation splits
 // against reference output.
 pub fn TestTokenize() {
